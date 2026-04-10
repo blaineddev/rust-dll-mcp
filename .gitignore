@@ -1,0 +1,12 @@
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/                                                                                                                               
+# uv
+.uv/
+work/
+*.db
+*.token
+Thumbs.db

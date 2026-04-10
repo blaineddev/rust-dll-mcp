@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:claude.ai)",
+      "Bash(grep -E '\\\\b[a-z]{1,3}\\\\b' /mnt/c/Users/chris/Desktop/Development/Rust/dll-mcp/rust_dll_mcp/__main__.py /mnt/c/Users/chris/Desktop/Development/Rust/dll-mcp/tests/conftest.py)",
+      "Bash(python3 -m tomllib)",
+      "Bash(python3:*)",
+      "Bash(python:*)",
+      "Bash(uv run:*)"
+    ]
+  }
+}

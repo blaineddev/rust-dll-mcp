@@ -1,0 +1,181 @@
+import sqlite3
+
+
+def create_schema(connection: sqlite3.Connection) -> None:
+	connection.executescript("""
+		CREATE TABLE IF NOT EXISTS assemblies (
+			id INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			version TEXT,
+			source TEXT
+		);
+
+		CREATE TABLE IF NOT EXISTS types (
+			id INTEGER PRIMARY KEY,
+			assembly_id INTEGER REFERENCES assemblies(id),
+			namespace TEXT,
+			name TEXT NOT NULL,
+			fully_qualified_name TEXT NOT NULL,
+			kind TEXT,
+			access_modifier TEXT,
+			source_code TEXT,
+			base_type TEXT,
+			interfaces TEXT
+		);
+
+		CREATE TABLE IF NOT EXISTS members (
+			id INTEGER PRIMARY KEY,
+			type_id INTEGER REFERENCES types(id),
+			name TEXT NOT NULL,
+			kind TEXT,
+			return_type TEXT,
+			parameters TEXT,
+			access_modifier TEXT,
+			attributes TEXT,
+			source_code TEXT
+		);
+
+		CREATE TABLE IF NOT EXISTS wipe_metadata (
+			build_id TEXT NOT NULL,
+			wipe_date TEXT NOT NULL,
+			previous_build_id TEXT,
+			indexed_at TEXT NOT NULL
+		);
+
+		CREATE VIRTUAL TABLE IF NOT EXISTS types_fts USING fts5(
+			fully_qualified_name,
+			source_code,
+			content='types'
+		);
+
+		CREATE VIRTUAL TABLE IF NOT EXISTS members_fts USING fts5(
+			name,
+			source_code,
+			content='members'
+		);
+	""")
+	connection.commit()
+
+
+def query_find_type(connection: sqlite3.Connection, name: str) -> list[sqlite3.Row]:
+	"""Fuzzy search for types by name. FTS5 first, LIKE fallback."""
+	fts_rows = connection.execute(
+		"""
+		SELECT t.id, t.name, t.fully_qualified_name, t.kind, t.namespace, a.name AS assembly_name
+		FROM types_fts
+		JOIN types t ON types_fts.rowid = t.id
+		LEFT JOIN assemblies a ON t.assembly_id = a.id
+		WHERE types_fts MATCH ?
+		LIMIT 10
+		""",
+		(name,),
+	).fetchall()
+
+	if fts_rows:
+		return fts_rows
+
+	return connection.execute(
+		"""
+		SELECT t.id, t.name, t.fully_qualified_name, t.kind, t.namespace, a.name AS assembly_name
+		FROM types t
+		LEFT JOIN assemblies a ON t.assembly_id = a.id
+		WHERE t.name LIKE ?
+		LIMIT 10
+		""",
+		(f"%{name}%",),
+	).fetchall()
+
+
+def query_get_type_members(connection: sqlite3.Connection, fully_qualified_name: str) -> list[sqlite3.Row]:
+	return connection.execute(
+		"""
+		SELECT m.id, m.name, m.kind, m.return_type, m.parameters, m.access_modifier, m.attributes
+		FROM members m
+		JOIN types t ON m.type_id = t.id
+		WHERE t.fully_qualified_name = ?
+		ORDER BY m.kind, m.name
+		""",
+		(fully_qualified_name,),
+	).fetchall()
+
+
+def query_get_method_source(
+	connection: sqlite3.Connection,
+	type_fqn: str,
+	method_name: str,
+) -> str | None:
+	row = connection.execute(
+		"""
+		SELECT m.source_code
+		FROM members m
+		JOIN types t ON m.type_id = t.id
+		WHERE t.fully_qualified_name = ?
+		  AND m.name = ?
+		  AND m.kind IN ('method', 'constructor')
+		LIMIT 1
+		""",
+		(type_fqn, method_name),
+	).fetchone()
+	return row["source_code"] if row else None
+
+
+def query_search_usages(connection: sqlite3.Connection, symbol: str) -> list[sqlite3.Row]:
+	return connection.execute(
+		"""
+		SELECT m.id, m.name, m.kind, t.fully_qualified_name AS type_fqn
+		FROM members_fts
+		JOIN members m ON members_fts.rowid = m.id
+		JOIN types t ON m.type_id = t.id
+		WHERE members_fts MATCH ?
+		LIMIT 50
+		""",
+		(symbol,),
+	).fetchall()
+
+
+def query_get_hook_signature(connection: sqlite3.Connection, hook_name: str) -> list[sqlite3.Row]:
+	return connection.execute(
+		"""
+		SELECT m.name, m.return_type, m.parameters, m.attributes, t.fully_qualified_name AS type_fqn
+		FROM members m
+		JOIN types t ON m.type_id = t.id
+		JOIN assemblies a ON t.assembly_id = a.id
+		WHERE a.source = 'oxide'
+		  AND (m.name = ? OR m.attributes LIKE ?)
+		LIMIT 10
+		""",
+		(hook_name, f'%"{hook_name}"%'),
+	).fetchall()
+
+
+def query_diff_since_last_wipe(
+	current_connection: sqlite3.Connection,
+	previous_connection: sqlite3.Connection,
+	type_fqn: str,
+) -> dict:
+	"""Compare members of a type between two DB connections. Returns {added, removed, changed}."""
+	def get_members(connection: sqlite3.Connection) -> dict[str, sqlite3.Row]:
+		rows = connection.execute(
+			"""
+			SELECT m.name, m.kind, m.return_type, m.parameters, m.source_code
+			FROM members m
+			JOIN types t ON m.type_id = t.id
+			WHERE t.fully_qualified_name = ?
+			""",
+			(type_fqn,),
+		).fetchall()
+		return {row["name"]: row for row in rows}
+
+	current_members = get_members(current_connection)
+	previous_members = get_members(previous_connection)
+
+	added = [dict(row) for name, row in current_members.items() if name not in previous_members]
+	removed = [dict(row) for name, row in previous_members.items() if name not in current_members]
+	changed = [
+		{"name": name, "current": dict(current_members[name]), "previous": dict(previous_members[name])}
+		for name in current_members
+		if name in previous_members
+		and current_members[name]["source_code"] != previous_members[name]["source_code"]
+	]
+
+	return {"added": added, "removed": removed, "changed": changed}

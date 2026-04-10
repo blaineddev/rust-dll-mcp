@@ -1,0 +1,68 @@
+import json
+import sqlite3
+import pytest
+from pathlib import Path
+from tests.conftest import SAMPLE_CS
+from pipeline.build_index import index_cs_file, populate_fts
+from rust_dll_mcp.db import create_schema
+from rust_dll_mcp.tools import (
+	tool_find_type,
+	tool_get_type_members,
+	tool_get_method_source,
+	tool_search_usages,
+	tool_get_hook_signature,
+	tool_diff_since_last_wipe,
+)
+
+
+@pytest.fixture
+def populated_connection(tmp_path):
+	cs_file = tmp_path / "Assembly-CSharp.cs"
+	cs_file.write_text(SAMPLE_CS)
+	connection = sqlite3.connect(":memory:")
+	connection.row_factory = sqlite3.Row
+	create_schema(connection)
+	index_cs_file(connection, cs_file, source="rust")
+	populate_fts(connection)
+	return connection
+
+
+@pytest.mark.asyncio
+async def test_find_type_returns_list(populated_connection):
+	result = await tool_find_type(populated_connection, None, "PlayerInventory")
+	assert isinstance(result, list)
+	assert len(result) >= 1
+	assert result[0]["fully_qualified_name"] == "Rust.PlayerInventory"
+
+
+@pytest.mark.asyncio
+async def test_get_type_members_returns_list(populated_connection):
+	result = await tool_get_type_members(populated_connection, None, "Rust.PlayerInventory")
+	names = [member["name"] for member in result]
+	assert "GiveItem" in names
+
+
+@pytest.mark.asyncio
+async def test_get_method_source_returns_string(populated_connection):
+	result = await tool_get_method_source(populated_connection, None, "Rust.PlayerInventory", "GiveItem")
+	assert isinstance(result, str)
+	assert "containerMain" in result
+
+
+@pytest.mark.asyncio
+async def test_get_method_source_unknown_returns_message(populated_connection):
+	result = await tool_get_method_source(populated_connection, None, "Rust.PlayerInventory", "NoSuchMethod")
+	assert "not found" in result.lower()
+
+
+@pytest.mark.asyncio
+async def test_search_usages_returns_list(populated_connection):
+	result = await tool_search_usages(populated_connection, None, "containerMain")
+	assert isinstance(result, list)
+	assert len(result) >= 1
+
+
+@pytest.mark.asyncio
+async def test_diff_no_previous_db_returns_message(populated_connection):
+	result = await tool_diff_since_last_wipe(populated_connection, None, "Rust.PlayerInventory")
+	assert "not available" in result.lower()
