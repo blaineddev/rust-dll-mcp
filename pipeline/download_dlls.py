@@ -62,14 +62,25 @@ def download_depot(steamcmd_executable: Path, output_dir: Path) -> None:
 		check=True,
 	)
 
-	# SteamCMD downloads to a fixed path; copy to output_dir
-	steam_download_path = Path.home() / ".steam" / "steamapps" / "content" / f"app_{STEAM_APP_ID}" / f"depot_{STEAM_DEPOT_ID}"
-	if not steam_download_path.exists():
-		# Fallback Windows path
-		steam_download_path = Path(os.environ.get("LOCALAPPDATA", "")) / "Steam" / "steamapps" / "content" / f"app_{STEAM_APP_ID}" / f"depot_{STEAM_DEPOT_ID}"
+	# SteamCMD downloads depot relative to its own install directory.
+	# Linux: {steamcmd_dir}/linux32/steamapps/content/app_{id}/depot_{id}
+	# Windows: {steamcmd_dir}/steamapps/content/app_{id}/depot_{id}
+	# Fallback: ~/.steam/steamapps/content/... (older SteamCMD behaviour)
+	steamcmd_dir = steamcmd_executable.parent
+	depot_relative = Path("steamapps") / "content" / f"app_{STEAM_APP_ID}" / f"depot_{STEAM_DEPOT_ID}"
 
-	if not steam_download_path.exists():
-		print(f"ERROR: Could not find downloaded depot at {steam_download_path}", file=sys.stderr)
+	candidates = [
+		steamcmd_dir / "linux32" / depot_relative,
+		steamcmd_dir / depot_relative,
+		Path.home() / ".steam" / depot_relative,
+		Path(os.environ.get("LOCALAPPDATA", "")) / "Steam" / depot_relative,
+	]
+
+	steam_download_path = next((path for path in candidates if path.exists()), None)
+
+	if steam_download_path is None:
+		checked = "\n  ".join(str(path) for path in candidates)
+		print(f"ERROR: Could not find downloaded depot. Checked:\n  {checked}", file=sys.stderr)
 		sys.exit(1)
 
 	dll_files = list(steam_download_path.rglob("*.dll"))
