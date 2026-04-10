@@ -84,16 +84,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          PREV_URL=$(gh release list --limit 2 --json tagName,assets \
-            | python -c "
-          import json, sys
-          releases = json.load(sys.stdin)
-          if len(releases) >= 2:
-              assets = releases[1].get('assets', [])
-              print(assets[0]['url'] if assets else '')
-          else:
-              print('')
-          ")
+          PREV_TAG=$(gh release list --limit 2 --json tagName --jq '.[1].tagName // ""')
+          if [ -n "$PREV_TAG" ]; then
+            PREV_URL=$(gh release view "$PREV_TAG" --json assets --jq '.assets[0].url // ""')
+          else
+            PREV_URL=""
+          fi
           echo "previous_release_url=$PREV_URL" >> "$GITHUB_OUTPUT"
 
       - name: Update manifest.json and commit
