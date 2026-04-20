@@ -207,3 +207,56 @@ namespace Rust
 
 	current_connection.close()
 	previous_connection.close()
+
+
+def test_types_table_has_new_columns(bare_connection):
+	create_schema(bare_connection)
+	info = bare_connection.execute("PRAGMA table_info(types)").fetchall()
+	column_names = {row[1] for row in info}
+	assert "parent_type_id" in column_names
+	assert "is_static" in column_names
+	assert "is_abstract" in column_names
+	assert "is_sealed" in column_names
+	assert "doc_comment" in column_names
+
+
+def test_members_table_has_new_columns(bare_connection):
+	create_schema(bare_connection)
+	info = bare_connection.execute("PRAGMA table_info(members)").fetchall()
+	column_names = {row[1] for row in info}
+	assert "is_static" in column_names
+	assert "is_abstract" in column_names
+	assert "is_override" in column_names
+	assert "is_virtual" in column_names
+	assert "doc_comment" in column_names
+
+
+def test_schema_creates_indexes(bare_connection):
+	create_schema(bare_connection)
+	indexes = bare_connection.execute(
+		"SELECT name FROM sqlite_master WHERE type='index'"
+	).fetchall()
+	index_names = {row[0] for row in indexes}
+	assert "idx_types_fqn" in index_names
+	assert "idx_types_base_type" in index_names
+	assert "idx_members_type_id" in index_names
+
+
+def test_types_fts_has_doc_comment_column(bare_connection):
+	create_schema(bare_connection)
+	info = bare_connection.execute("PRAGMA table_info(types_fts)").fetchall()
+	column_names = {row[1] for row in info}
+	assert "doc_comment" in column_names
+
+
+def test_query_find_implementations_by_base_type(populated_connection):
+	from rust_dll_mcp.db import query_find_implementations
+	results = query_find_implementations(populated_connection, "BaseEntity")
+	assert any(row["fully_qualified_name"] == "Rust.PlayerInventory" for row in results)
+	assert any(row["match_reason"] == "base_type" for row in results)
+
+
+def test_query_find_implementations_returns_empty_for_unknown(populated_connection):
+	from rust_dll_mcp.db import query_find_implementations
+	results = query_find_implementations(populated_connection, "UnknownXYZ")
+	assert results == []

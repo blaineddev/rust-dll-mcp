@@ -12,6 +12,7 @@ from rust_dll_mcp.tools import (
 	tool_search_usages,
 	tool_get_hook_signature,
 	tool_diff_since_last_wipe,
+	tool_find_implementations,
 )
 
 
@@ -66,3 +67,47 @@ async def test_search_usages_returns_list(populated_connection):
 async def test_diff_no_previous_db_returns_message(populated_connection):
 	result = await tool_diff_since_last_wipe(populated_connection, None, "Rust.PlayerInventory")
 	assert "not available" in result.lower()
+
+
+IMPLEMENTATIONS_CS = """\
+namespace Rust
+{
+	public class BaseEntity
+	{
+	}
+
+	public class BasePlayer : BaseEntity
+	{
+	}
+
+	public class BaseVehicle : BaseEntity
+	{
+	}
+}
+"""
+
+
+@pytest.fixture
+def implementations_connection(tmp_path):
+	cs_file = tmp_path / "Assembly-CSharp.cs"
+	cs_file.write_text(IMPLEMENTATIONS_CS)
+	connection = sqlite3.connect(":memory:")
+	connection.row_factory = sqlite3.Row
+	create_schema(connection)
+	index_cs_file(connection, cs_file, source="rust")
+	populate_fts(connection)
+	return connection
+
+
+@pytest.mark.asyncio
+async def test_find_implementations_returns_subclasses(implementations_connection):
+	result = await tool_find_implementations(implementations_connection, None, "BaseEntity")
+	fqns = {r["fully_qualified_name"] for r in result}
+	assert "Rust.BasePlayer" in fqns
+	assert "Rust.BaseVehicle" in fqns
+
+
+@pytest.mark.asyncio
+async def test_find_implementations_returns_empty_for_unknown(implementations_connection):
+	result = await tool_find_implementations(implementations_connection, None, "NoSuchType")
+	assert result == []

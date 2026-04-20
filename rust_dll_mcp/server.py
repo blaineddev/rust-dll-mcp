@@ -16,6 +16,7 @@ from rust_dll_mcp.tools import (
 	tool_search_usages,
 	tool_get_hook_signature,
 	tool_diff_since_last_wipe,
+	tool_find_implementations,
 )
 
 
@@ -107,6 +108,20 @@ async def run() -> None:
 					"required": ["type"],
 				},
 			),
+			types.Tool(
+				name="find_implementations",
+				description="Find all types that extend a base class or implement an interface.",
+				inputSchema={
+					"type": "object",
+					"properties": {
+						"type_name": {
+							"type": "string",
+							"description": "Base class or interface name, e.g. BaseEntity or IPlayer",
+						},
+					},
+					"required": ["type_name"],
+				},
+			),
 		]
 
 	@app.call_tool()
@@ -123,6 +138,8 @@ async def run() -> None:
 			result = await tool_get_hook_signature(current_connection, previous_connection, arguments["hook_name"])
 		elif name == "diff_since_last_wipe":
 			result = await tool_diff_since_last_wipe(current_connection, previous_connection, arguments["type"])
+		elif name == "find_implementations":
+			result = await tool_find_implementations(current_connection, previous_connection, arguments["type_name"])
 		else:
 			result = f"Unknown tool: {name}"
 

@@ -9,6 +9,7 @@ from rust_dll_mcp.db import (
 	query_search_usages,
 	query_get_hook_signature,
 	query_diff_since_last_wipe,
+	query_find_implementations,
 )
 
 
@@ -91,6 +92,23 @@ async def tool_get_hook_signature(
 			"return_type": row["return_type"],
 			"parameters": json.loads(row["parameters"] or "[]"),
 			"type_fqn": row["type_fqn"],
+		}
+		for row in rows
+	]
+
+
+async def tool_find_implementations(
+	connection: sqlite3.Connection,
+	previous_connection: sqlite3.Connection | None,
+	type_name: str,
+) -> list[dict]:
+	rows = query_find_implementations(connection, type_name)
+	return [
+		{
+			"fully_qualified_name": row["fully_qualified_name"],
+			"kind": row["kind"],
+			"assembly_name": row["assembly_name"],
+			"match_reason": row["match_reason"],
 		}
 		for row in rows
 	]
