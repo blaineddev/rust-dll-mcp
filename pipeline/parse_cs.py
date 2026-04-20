@@ -11,6 +11,11 @@ class ParsedMember:
 	access_modifier: str
 	attributes: list[str]
 	source_code: str
+	is_static: bool = False
+	is_abstract: bool = False
+	is_override: bool = False
+	is_virtual: bool = False
+	doc_comment: str | None = None
 
 
 @dataclass
@@ -24,13 +29,18 @@ class ParsedType:
 	interfaces: list[str]
 	source_code: str
 	members: list[ParsedMember] = dataclass_field(default_factory=list)
+	is_static: bool = False
+	is_abstract: bool = False
+	is_sealed: bool = False
+	doc_comment: str | None = None
+	parent_name: str | None = None
 
 
 NAMESPACE_PATTERN = re.compile(r'\bnamespace\s+([\w.]+)')
 
 TYPE_DECLARATION_PATTERN = re.compile(
 	r'(?P<access>public|internal|private|protected)?\s*'
-	r'(?:abstract|sealed|static|partial|readonly|\s)*'
+	r'(?P<modifiers>(?:(?:abstract|sealed|static|partial|readonly)\s+)*)'
 	r'(?P<kind>class|struct|enum|interface|delegate)\s+'
 	r'(?P<name>\w+)'
 	r'(?:\s*<[^>]+>)?'
@@ -64,6 +74,45 @@ CONSTRUCTOR_PATTERN = re.compile(
 	r'(?P<name>\w+)\s*\((?P<params>[^)]*)\)\s*[:{]',
 	re.MULTILINE,
 )
+
+ENUM_VALUE_PATTERN = re.compile(
+	r'^\s*(?P<name>[A-Za-z_]\w*)\s*(?:=\s*(?P<value>[^,\n}]+))?\s*[,\n}]',
+	re.MULTILINE,
+)
+
+_ENUM_RESERVED = frozenset({
+	'get', 'set', 'public', 'private', 'protected', 'internal',
+	'static', 'readonly', 'const', 'abstract', 'sealed', 'override',
+})
+
+PROPERTY_PATTERN = re.compile(
+	r'(?P<access>public|private|protected internal|protected|internal|private protected)\s+'
+	r'(?P<modifiers>(?:(?:static|virtual|abstract|override|sealed|new|unsafe)\s+)*)'
+	r'(?P<type>[\w\[\]<>.,\s?\*]+?)\s+'
+	r'(?P<name>\w+)\s*'
+	r'(?=\s*(?:=>|\{[^(]*(?:get|set|init)))',
+	re.MULTILINE,
+)
+
+
+def _extract_doc_comment(source: str, declaration_start: int) -> str | None:
+	"""Extract consecutive /// lines immediately preceding declaration_start, skipping blank lines."""
+	preceding = source[:declaration_start]
+	lines = preceding.split('\n')
+	doc_lines = []
+	for line in reversed(lines):
+		stripped = line.strip()
+		if stripped.startswith('///'):
+			doc_lines.insert(0, stripped[3:].strip())
+		elif stripped == '':
+			continue
+		else:
+			break
+	if not doc_lines:
+		return None
+	text = ' '.join(doc_lines)
+	text = re.sub(r'<[^>]+>', '', text).strip()
+	return text or None
 
 
 def _extract_block(source: str, start: int) -> tuple[str, int]:
@@ -169,9 +218,10 @@ def _parse_inheritance(inheritance_str: str) -> tuple[str, list[str]]:
 	return base_type, interfaces
 
 
-def _strip_nested_types(body: str) -> str:
-	"""Remove nested type declarations and their bodies from a type body string."""
+def _extract_nested_type_sources(body: str) -> tuple[str, list[str]]:
+	"""Strip nested type declarations from body, returning (cleaned_body, list_of_nested_sources)."""
 	result = []
+	nested_sources = []
 	search_start = 0
 	while True:
 		match = TYPE_DECLARATION_PATTERN.search(body, search_start)
@@ -180,14 +230,109 @@ def _strip_nested_types(body: str) -> str:
 			break
 		result.append(body[search_start:match.start()])
 		_, end_position = _extract_block(body, match.end())
+		nested_sources.append(body[match.start():end_position])
 		search_start = end_position
-	return ''.join(result)
+	return ''.join(result), nested_sources
+
+
+def _parse_nested_types(nested_sources: list[str], parent_fqn: str, namespace: str) -> list[ParsedType]:
+	parsed = []
+	for source in nested_sources:
+		match = TYPE_DECLARATION_PATTERN.search(source)
+		if not match:
+			continue
+		kind = match.group('kind')
+		name = match.group('name')
+		access_modifier = match.group('access') or 'private'
+		modifiers_str = match.group('modifiers') or ''
+		inheritance_str = (match.group('inheritance') or '').strip()
+		base_type, interfaces = _parse_inheritance(inheritance_str)
+		fully_qualified_name = f"{parent_fqn}.{name}"
+
+		body, end_position = _extract_block(source, match.end())
+		clean_body, further_nested = _extract_nested_type_sources(body)
+
+		members = _parse_members(clean_body) if kind != 'enum' else _parse_enum_values(clean_body)
+		doc_comment = _extract_doc_comment(source, match.start())
+
+		parsed.append(ParsedType(
+			namespace=namespace,
+			name=name,
+			fully_qualified_name=fully_qualified_name,
+			kind=kind,
+			access_modifier=access_modifier,
+			base_type=base_type,
+			interfaces=interfaces,
+			source_code=source[:end_position],
+			members=members,
+			is_static='static' in modifiers_str,
+			is_abstract='abstract' in modifiers_str,
+			is_sealed='sealed' in modifiers_str,
+			doc_comment=doc_comment,
+			parent_name=parent_fqn,
+		))
+
+		parsed.extend(_parse_nested_types(further_nested, fully_qualified_name, namespace))
+	return parsed
+
+
+def _parse_enum_values(body: str) -> list[ParsedMember]:
+	members = []
+	for match in ENUM_VALUE_PATTERN.finditer(body):
+		name = match.group('name')
+		if name in _ENUM_RESERVED:
+			continue
+		value = (match.group('value') or '').strip()
+		members.append(ParsedMember(
+			name=name,
+			kind='enum_value',
+			return_type=value,
+			parameters=[],
+			access_modifier='public',
+			attributes=[],
+			source_code=match.group(0).strip(),
+		))
+	return members
+
+
+def _parse_properties(type_body: str) -> list[ParsedMember]:
+	members = []
+	for match in PROPERTY_PATTERN.finditer(type_body):
+		name = match.group('name')
+		property_type = match.group('type').strip()
+		access = match.group('access')
+		modifiers_str = match.group('modifiers') or ''
+
+		after = type_body[match.end():]
+		if after.lstrip().startswith('=>'):
+			semi = after.find(';')
+			end_pos = match.end() + semi + 1 if semi != -1 else len(type_body)
+		else:
+			_, end_pos = _extract_block(type_body, match.end())
+
+		source_code = type_body[match.start():end_pos]
+
+		members.append(ParsedMember(
+			name=name,
+			kind='property',
+			return_type=property_type,
+			parameters=[],
+			access_modifier=access,
+			attributes=[],
+			source_code=source_code.strip(),
+			is_static='static' in modifiers_str,
+			is_abstract='abstract' in modifiers_str,
+			is_override='override' in modifiers_str,
+			is_virtual='virtual' in modifiers_str,
+			doc_comment=_extract_doc_comment(type_body, match.start()),
+		))
+	return members
 
 
 def _parse_members(type_body: str) -> list[ParsedMember]:
 	members = []
 
-	type_body = _strip_nested_types(type_body)
+	type_body, _ = _extract_nested_type_sources(type_body)
 
 	for match in METHOD_PATTERN.finditer(type_body):
 		name = match.group('name')
@@ -201,6 +346,7 @@ def _parse_members(type_body: str) -> list[ParsedMember]:
 
 		attributes_str = match.group('attributes') or ''
 		attributes = ATTRIBUTE_PATTERN.findall(attributes_str)
+		method_modifiers = match.group('modifiers') or ''
 
 		members.append(ParsedMember(
 			name=name,
@@ -210,6 +356,11 @@ def _parse_members(type_body: str) -> list[ParsedMember]:
 			access_modifier=match.group('access'),
 			attributes=attributes,
 			source_code=source_code.strip(),
+			is_static='static' in method_modifiers,
+			is_abstract='abstract' in method_modifiers,
+			is_override='override' in method_modifiers,
+			is_virtual='virtual' in method_modifiers,
+			doc_comment=_extract_doc_comment(type_body, match.start()),
 		))
 
 	method_names = {member.name for member in members}
@@ -236,10 +387,14 @@ def _parse_members(type_body: str) -> list[ParsedMember]:
 		))
 		method_names.add(name)
 
+	property_members = _parse_properties(type_body)
+	property_names = {member.name for member in property_members}
+	members.extend(property_members)
+
 	seen_field_names = set()
 	for match in FIELD_PATTERN.finditer(type_body):
 		name = match.group('name')
-		if name in method_names:
+		if name in method_names or name in property_names:
 			continue
 		if name in seen_field_names:
 			continue
@@ -274,6 +429,7 @@ def parse_cs_file(source: str) -> list[ParsedType]:
 		kind = match.group('kind')
 		name = match.group('name')
 		access_modifier = match.group('access') or 'internal'
+		modifiers_str = match.group('modifiers') or ''
 		inheritance_str = (match.group('inheritance') or '').strip()
 		base_type, interfaces = _parse_inheritance(inheritance_str)
 		fully_qualified_name = f"{namespace}.{name}" if namespace else name
@@ -281,7 +437,10 @@ def parse_cs_file(source: str) -> list[ParsedType]:
 		body, end_position = _extract_block(source, match.end())
 		type_source = source[match.start():end_position]
 
-		members = _parse_members(body) if kind != 'enum' else []
+		clean_body, nested_sources = _extract_nested_type_sources(body)
+		members = _parse_members(clean_body) if kind != 'enum' else _parse_enum_values(clean_body)
+
+		doc_comment = _extract_doc_comment(source, match.start())
 
 		parsed_types.append(ParsedType(
 			namespace=namespace,
@@ -293,7 +452,13 @@ def parse_cs_file(source: str) -> list[ParsedType]:
 			interfaces=interfaces,
 			source_code=type_source,
 			members=members,
+			is_static='static' in modifiers_str,
+			is_abstract='abstract' in modifiers_str,
+			is_sealed='sealed' in modifiers_str,
+			doc_comment=doc_comment,
 		))
+
+		parsed_types.extend(_parse_nested_types(nested_sources, fully_qualified_name, namespace))
 
 		search_start = end_position
 

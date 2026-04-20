@@ -36,13 +36,18 @@ def index_cs_file(
 	source_text = cs_file.read_text(encoding="utf-8", errors="replace")
 	parsed_types = parse_cs_file(source_text)
 
+	fqn_to_id: dict[str, int] = {}
+
 	for parsed_type in parsed_types:
+		parent_id = fqn_to_id.get(parsed_type.parent_name) if parsed_type.parent_name else None
+
 		cursor = connection.execute(
 			"""
 			INSERT INTO types (
 				assembly_id, namespace, name, fully_qualified_name,
-				kind, access_modifier, source_code, base_type, interfaces
-			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+				kind, access_modifier, source_code, base_type, interfaces,
+				parent_type_id, is_static, is_abstract, is_sealed, doc_comment
+			) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			""",
 			(
 				assembly_id,
@@ -54,17 +59,24 @@ def index_cs_file(
 				parsed_type.source_code,
 				parsed_type.base_type,
 				json.dumps(parsed_type.interfaces),
+				parent_id,
+				int(parsed_type.is_static),
+				int(parsed_type.is_abstract),
+				int(parsed_type.is_sealed),
+				parsed_type.doc_comment,
 			),
 		)
 		type_id = cursor.lastrowid
+		fqn_to_id[parsed_type.fully_qualified_name] = type_id
 
 		for member in parsed_type.members:
 			connection.execute(
 				"""
 				INSERT INTO members (
 					type_id, name, kind, return_type, parameters,
-					access_modifier, attributes, source_code
-				) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+					access_modifier, attributes, source_code,
+					is_static, is_abstract, is_override, is_virtual, doc_comment
+				) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 				""",
 				(
 					type_id,
@@ -75,6 +87,11 @@ def index_cs_file(
 					member.access_modifier,
 					json.dumps(member.attributes),
 					member.source_code,
+					int(member.is_static),
+					int(member.is_abstract),
+					int(member.is_override),
+					int(member.is_virtual),
+					member.doc_comment,
 				),
 			)
 
