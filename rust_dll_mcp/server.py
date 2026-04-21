@@ -59,6 +59,7 @@ async def run() -> None:
 					"type": "object",
 					"properties": {
 						"fully_qualified_name": {"type": "string", "description": "Fully qualified type name, e.g. Rust.PlayerInventory"},
+						"assembly_name": {"type": "string", "description": "Filter by assembly name, e.g. Assembly-CSharp.decompiled. Use when find_type returns multiple matches with the same name."},
 					},
 					"required": ["fully_qualified_name"],
 				},
@@ -129,7 +130,7 @@ async def run() -> None:
 		if name == "find_type":
 			result = await tool_find_type(current_connection, previous_connection, arguments["name"])
 		elif name == "get_type_members":
-			result = await tool_get_type_members(current_connection, previous_connection, arguments["fully_qualified_name"])
+			result = await tool_get_type_members(current_connection, previous_connection, arguments["fully_qualified_name"], arguments.get("assembly_name"))
 		elif name == "get_method_source":
 			result = await tool_get_method_source(current_connection, previous_connection, arguments["type"], arguments["method"])
 		elif name == "search_usages":

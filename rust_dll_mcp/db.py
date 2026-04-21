@@ -107,7 +107,24 @@ def query_find_type(connection: sqlite3.Connection, name: str) -> list[sqlite3.R
 	).fetchall()
 
 
-def query_get_type_members(connection: sqlite3.Connection, fully_qualified_name: str) -> list[sqlite3.Row]:
+def query_get_type_members(
+	connection: sqlite3.Connection,
+	fully_qualified_name: str,
+	assembly_name: str | None = None,
+) -> list[sqlite3.Row]:
+	if assembly_name:
+		return connection.execute(
+			"""
+			SELECT m.id, m.name, m.kind, m.return_type, m.parameters, m.access_modifier, m.attributes
+			FROM members m
+			JOIN types t ON m.type_id = t.id
+			JOIN assemblies a ON t.assembly_id = a.id
+			WHERE t.fully_qualified_name = ?
+			  AND a.name = ?
+			ORDER BY m.kind, m.name
+			""",
+			(fully_qualified_name, assembly_name),
+		).fetchall()
 	return connection.execute(
 		"""
 		SELECT m.id, m.name, m.kind, m.return_type, m.parameters, m.access_modifier, m.attributes

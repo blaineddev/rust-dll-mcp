@@ -35,8 +35,9 @@ async def tool_get_type_members(
 	connection: sqlite3.Connection,
 	previous_connection: sqlite3.Connection | None,
 	fully_qualified_name: str,
+	assembly_name: str | None = None,
 ) -> list[dict]:
-	rows = query_get_type_members(connection, fully_qualified_name)
+	rows = query_get_type_members(connection, fully_qualified_name, assembly_name)
 	return [
 		{
 			"name": row["name"],
