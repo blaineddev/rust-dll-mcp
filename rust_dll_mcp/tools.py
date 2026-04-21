@@ -86,16 +86,27 @@ async def tool_get_hook_signature(
 ) -> list[dict]:
 	rows = query_get_hook_signature(connection, hook_name)
 	if not rows:
-		return [{"message": f"Hook '{hook_name}' not found in Oxide assemblies."}]
-	return [
-		{
-			"name": row["name"],
-			"return_type": row["return_type"],
-			"parameters": json.loads(row["parameters"] or "[]"),
-			"type_fqn": row["type_fqn"],
-		}
-		for row in rows
-	]
+		return [{"message": f"Hook '{hook_name}' not found in Oxide assemblies or game call sites."}]
+	results = []
+	for row in rows:
+		# row may be a sqlite3.Row or a plain dict (from hook call-site conversion)
+		if isinstance(row, dict):
+			results.append({
+				"name": row["name"],
+				"return_type": row["return_type"],
+				"parameters": json.loads(row["parameters"] or "[]"),
+				"type_fqn": row["type_fqn"],
+				"source": "call_site",
+			})
+		else:
+			results.append({
+				"name": row["name"],
+				"return_type": row["return_type"],
+				"parameters": json.loads(row["parameters"] or "[]"),
+				"type_fqn": row["type_fqn"],
+				"source": "oxide",
+			})
+	return results
 
 
 async def tool_find_implementations(

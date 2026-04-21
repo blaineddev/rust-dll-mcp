@@ -1,6 +1,6 @@
 import pytest
 from tests.conftest import SAMPLE_CS
-from pipeline.parse_cs import parse_cs_file, ParsedType, ParsedMember
+from pipeline.parse_cs import parse_cs_file, ParsedType, ParsedMember, extract_hook_calls
 
 
 def test_parse_finds_one_type():
@@ -360,3 +360,121 @@ def test_parent_type_still_has_own_methods():
 	base_player = next(t for t in types if t.name == "BasePlayer")
 	member_names = {m.name for m in base_player.members}
 	assert "Die" in member_names
+
+
+HOOK_CALLS_CS = """\
+namespace Rust
+{
+	public class BasePlayer
+	{
+		public void Die(HitInfo info)
+		{
+			Interface.CallHook("OnPlayerDeath", this, info);
+		}
+
+		public void Respawn()
+		{
+			object result = Interface.Call("OnPlayerRespawn", this);
+		}
+
+		public void DoNothing()
+		{
+			int x = 1;
+		}
+	}
+}
+"""
+
+
+def test_extract_hook_calls_finds_callhook():
+	types = parse_cs_file(HOOK_CALLS_CS)
+	hooks = extract_hook_calls(types)
+	names = {h.hook_name for h in hooks}
+	assert "OnPlayerDeath" in names
+
+
+def test_extract_hook_calls_finds_plain_call():
+	types = parse_cs_file(HOOK_CALLS_CS)
+	hooks = extract_hook_calls(types)
+	names = {h.hook_name for h in hooks}
+	assert "OnPlayerRespawn" in names
+
+
+def test_extract_hook_calls_records_calling_method():
+	types = parse_cs_file(HOOK_CALLS_CS)
+	hooks = extract_hook_calls(types)
+	death = next(h for h in hooks if h.hook_name == "OnPlayerDeath")
+	assert death.calling_method == "Die"
+	assert death.calling_type_fqn == "Rust.BasePlayer"
+
+
+def test_extract_hook_calls_captures_args_without_leading_comma():
+	types = parse_cs_file(HOOK_CALLS_CS)
+	hooks = extract_hook_calls(types)
+	death = next(h for h in hooks if h.hook_name == "OnPlayerDeath")
+	assert not death.args_snippet.startswith(",")
+	assert "this" in death.args_snippet
+	assert "info" in death.args_snippet
+
+
+def test_extract_hook_calls_dedupes_same_site():
+	duplicate_cs = """\
+namespace Rust
+{
+	public class Foo
+	{
+		public void Bar()
+		{
+			Interface.CallHook("OnThing", 1);
+			Interface.CallHook("OnThing", 2);
+		}
+	}
+}
+"""
+	types = parse_cs_file(duplicate_cs)
+	hooks = extract_hook_calls(types)
+	on_thing = [h for h in hooks if h.hook_name == "OnThing"]
+	assert len(on_thing) == 1
+
+
+def test_extract_hook_calls_ignores_methods_without_hooks():
+	types = parse_cs_file(HOOK_CALLS_CS)
+	hooks = extract_hook_calls(types)
+	assert not any(h.calling_method == "DoNothing" for h in hooks)
+
+
+NO_ACCESS_FIELD_CS = """\
+namespace Rust
+{
+	public class Foo
+	{
+		static int counter;
+		readonly string label = "x";
+		const int MaxValue = 100;
+
+		public void DoWork()
+		{
+		}
+	}
+}
+"""
+
+
+def test_parse_field_without_access_modifier_detected():
+	types = parse_cs_file(NO_ACCESS_FIELD_CS)
+	field_names = {m.name for m in types[0].members if m.kind == "field"}
+	assert "counter" in field_names
+	assert "label" in field_names
+	assert "MaxValue" in field_names
+
+
+def test_parse_field_without_access_modifier_defaults_to_internal():
+	types = parse_cs_file(NO_ACCESS_FIELD_CS)
+	counter = next(m for m in types[0].members if m.name == "counter")
+	assert counter.access_modifier == "internal"
+
+
+def test_parse_field_without_access_modifier_does_not_override_method():
+	types = parse_cs_file(NO_ACCESS_FIELD_CS)
+	field_names = {m.name for m in types[0].members if m.kind == "field"}
+	assert "DoWork" not in field_names

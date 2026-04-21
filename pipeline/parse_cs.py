@@ -3,6 +3,14 @@ from dataclasses import dataclass, field as dataclass_field
 
 
 @dataclass
+class ParsedHookCall:
+	hook_name: str
+	calling_type_fqn: str
+	calling_method: str
+	args_snippet: str  # raw argument text after the hook name
+
+
+@dataclass
 class ParsedMember:
 	name: str
 	kind: str
@@ -38,6 +46,13 @@ class ParsedType:
 
 NAMESPACE_PATTERN = re.compile(r'\bnamespace\s+([\w.]+)')
 
+# Matches Interface.CallHook("HookName", arg1, arg2, ...) and Interface.Call("HookName", ...)
+HOOK_CALL_PATTERN = re.compile(
+	r'Interface\.(?:CallHook|Call)\s*\(\s*"(?P<hook_name>\w+)"'
+	r'(?P<args_tail>[^)]*)\)',
+	re.MULTILINE,
+)
+
 TYPE_DECLARATION_PATTERN = re.compile(
 	r'(?P<access>public|internal|private|protected)?\s*'
 	r'(?P<modifiers>(?:(?:abstract|sealed|static|partial|readonly)\s+)*)'
@@ -63,8 +78,16 @@ METHOD_PATTERN = re.compile(
 
 FIELD_PATTERN = re.compile(
 	r'(?P<access>public|private|protected internal|protected|internal|private protected)\s+'
-	r'(?P<modifiers>(?:(?:static|readonly|const|volatile)\s+)*)'
-	r'(?P<type>[\w\[\]<>.,\s?\*]+?)\s+'
+	r'(?P<modifiers>(?:(?:static|readonly|const|volatile|new)\s+)*)'
+	r'(?P<type>[\w\[\]<>.,?\*]+(?:\s*<[^>]+>)?)\s+'
+	r'(?P<name>\w+)\s*[;=]',
+	re.MULTILINE,
+)
+
+# Fallback for fields without explicit access modifiers (ILSpy sometimes omits them)
+FIELD_NO_ACCESS_PATTERN = re.compile(
+	r'^\s+(?P<modifiers>(?:(?:static|readonly|const|volatile|new)\s+)+)'
+	r'(?P<type>[\w\[\]<>.,?\*]+(?:\s*<[^>]+>)?)\s+'
 	r'(?P<name>\w+)\s*[;=]',
 	re.MULTILINE,
 )
@@ -392,6 +415,7 @@ def _parse_members(type_body: str) -> list[ParsedMember]:
 	members.extend(property_members)
 
 	seen_field_names = set()
+	# Primary: fields with explicit access modifiers
 	for match in FIELD_PATTERN.finditer(type_body):
 		name = match.group('name')
 		if name in method_names or name in property_names:
@@ -406,6 +430,25 @@ def _parse_members(type_body: str) -> list[ParsedMember]:
 			return_type=match.group('type').strip(),
 			parameters=[],
 			access_modifier=match.group('access'),
+			attributes=[],
+			source_code=match.group(0).strip(),
+		))
+
+	# Fallback: fields without access modifiers (ILSpy sometimes omits them)
+	for match in FIELD_NO_ACCESS_PATTERN.finditer(type_body):
+		name = match.group('name')
+		if name in method_names or name in property_names:
+			continue
+		if name in seen_field_names:
+			continue
+		seen_field_names.add(name)
+
+		members.append(ParsedMember(
+			name=name,
+			kind='field',
+			return_type=match.group('type').strip(),
+			parameters=[],
+			access_modifier='internal',  # default when omitted
 			attributes=[],
 			source_code=match.group(0).strip(),
 		))
@@ -463,3 +506,31 @@ def parse_cs_file(source: str) -> list[ParsedType]:
 		search_start = end_position
 
 	return parsed_types
+
+
+def extract_hook_calls(parsed_types: list[ParsedType]) -> list[ParsedHookCall]:
+	"""Scan method source code for Interface.CallHook/Call patterns."""
+	hooks: list[ParsedHookCall] = []
+	seen: set[tuple[str, str, str]] = set()  # (hook_name, type_fqn, method_name)
+
+	for parsed_type in parsed_types:
+		for member in parsed_type.members:
+			if member.kind not in ('method', 'constructor'):
+				continue
+			for match in HOOK_CALL_PATTERN.finditer(member.source_code):
+				hook_name = match.group('hook_name')
+				key = (hook_name, parsed_type.fully_qualified_name, member.name)
+				if key in seen:
+					continue
+				seen.add(key)
+				args_tail = match.group('args_tail').strip()
+				# Strip leading comma
+				if args_tail.startswith(','):
+					args_tail = args_tail[1:].strip()
+				hooks.append(ParsedHookCall(
+					hook_name=hook_name,
+					calling_type_fqn=parsed_type.fully_qualified_name,
+					calling_method=member.name,
+					args_snippet=args_tail,
+				))
+	return hooks
