@@ -1,4 +1,29 @@
+import json
 import sqlite3
+
+# Noise namespaces filtered out of find_type results at query time.
+# Mirrors the exclusion list in pipeline/build_index.py for existing DBs.
+_EXCLUDED_FQN_PREFIXES = (
+	"Microsoft.CodeAnalysis",
+	"System.Runtime.CompilerServices",
+	"System.Reflection",
+	"System.Diagnostics.CodeAnalysis",
+	"System.ComponentModel",
+	"<PrivateImplementationDetails>",
+	"Internal.Runtime",
+	"System.Numerics",
+	"System.Buffers",
+	"System.Memory",
+	"System.Threading.Tasks.Sources",
+)
+
+
+def _filter_noise_types(rows: list[sqlite3.Row]) -> list[sqlite3.Row]:
+	"""Remove types from noise namespaces."""
+	return [
+		row for row in rows
+		if not any(row["fully_qualified_name"].startswith(p) for p in _EXCLUDED_FQN_PREFIXES)
+	]
 
 
 def create_schema(connection: sqlite3.Connection) -> None:
@@ -44,6 +69,18 @@ def create_schema(connection: sqlite3.Connection) -> None:
 			is_virtual INTEGER NOT NULL DEFAULT 0,
 			doc_comment TEXT
 		);
+
+		CREATE TABLE IF NOT EXISTS hooks (
+			id INTEGER PRIMARY KEY,
+			name TEXT NOT NULL,
+			calling_type_fqn TEXT NOT NULL,
+			calling_method TEXT NOT NULL,
+			parameters TEXT,
+			source_context TEXT,
+			assembly_id INTEGER REFERENCES assemblies(id)
+		);
+
+		CREATE INDEX IF NOT EXISTS idx_hooks_name ON hooks(name);
 
 		CREATE TABLE IF NOT EXISTS wipe_metadata (
 			build_id TEXT NOT NULL,
@@ -93,18 +130,19 @@ def query_find_type(connection: sqlite3.Connection, name: str) -> list[sqlite3.R
 	).fetchall()
 
 	if fts_rows:
-		return fts_rows
+		return _filter_noise_types(fts_rows)
 
-	return connection.execute(
+	rows = connection.execute(
 		"""
 		SELECT t.id, t.name, t.fully_qualified_name, t.kind, t.namespace, a.name AS assembly_name
 		FROM types t
 		LEFT JOIN assemblies a ON t.assembly_id = a.id
 		WHERE t.name LIKE ?
-		LIMIT 10
+		LIMIT 25
 		""",
 		(f"%{name}%",),
 	).fetchall()
+	return _filter_noise_types(rows)[:10]
 
 
 def query_get_type_members(
@@ -172,7 +210,8 @@ def query_search_usages(connection: sqlite3.Connection, symbol: str) -> list[sql
 
 
 def query_get_hook_signature(connection: sqlite3.Connection, hook_name: str) -> list[sqlite3.Row]:
-	return connection.execute(
+	# First check Oxide assembly members (original approach)
+	oxide_rows = connection.execute(
 		"""
 		SELECT m.name, m.return_type, m.parameters, m.attributes, t.fully_qualified_name AS type_fqn
 		FROM members m
@@ -184,6 +223,40 @@ def query_get_hook_signature(connection: sqlite3.Connection, hook_name: str) -> 
 		""",
 		(hook_name, f'%"{hook_name}"%'),
 	).fetchall()
+
+	# Also check the hooks table for Interface.CallHook/Call sites
+	hook_rows = []
+	try:
+		hook_rows = connection.execute(
+			"""
+			SELECT h.name, h.calling_type_fqn, h.calling_method, h.parameters AS call_args
+			FROM hooks h
+			WHERE h.name = ?
+			LIMIT 10
+			""",
+			(hook_name,),
+		).fetchall()
+	except sqlite3.OperationalError:
+		# hooks table may not exist in older DBs
+		pass
+
+	if oxide_rows or hook_rows:
+		results = list(oxide_rows)
+		# Convert hook call-site rows into a compatible format
+		for row in hook_rows:
+			parameters_payload = [{
+				"call_site": f'{row["calling_type_fqn"]}.{row["calling_method"]}',
+				"args": row["call_args"] or "",
+			}]
+			results.append({
+				"name": row["name"],
+				"return_type": "object",
+				"parameters": json.dumps(parameters_payload),
+				"type_fqn": row["calling_type_fqn"],
+			})
+		return results
+
+	return []
 
 
 def query_find_implementations(connection: sqlite3.Connection, type_name: str) -> list[sqlite3.Row]:

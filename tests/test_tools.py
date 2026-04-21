@@ -111,3 +111,51 @@ async def test_find_implementations_returns_subclasses(implementations_connectio
 async def test_find_implementations_returns_empty_for_unknown(implementations_connection):
 	result = await tool_find_implementations(implementations_connection, None, "NoSuchType")
 	assert result == []
+
+
+HOOK_CALLSITE_CS = """\
+namespace Rust
+{
+	public class BasePlayer
+	{
+		public void Die()
+		{
+			Interface.CallHook("OnPlayerDeath", this, "with \\"quoted\\" arg");
+		}
+	}
+}
+"""
+
+
+@pytest.fixture
+def hook_callsite_connection(tmp_path):
+	cs_file = tmp_path / "Assembly-CSharp.cs"
+	cs_file.write_text(HOOK_CALLSITE_CS)
+	connection = sqlite3.connect(":memory:")
+	connection.row_factory = sqlite3.Row
+	create_schema(connection)
+	index_cs_file(connection, cs_file, source="rust")
+	populate_fts(connection)
+	return connection
+
+
+@pytest.mark.asyncio
+async def test_tool_get_hook_signature_returns_callsite_source(hook_callsite_connection):
+	result = await tool_get_hook_signature(hook_callsite_connection, None, "OnPlayerDeath")
+	assert len(result) >= 1
+	assert result[0]["source"] == "call_site"
+	assert result[0]["parameters"][0]["call_site"] == "Rust.BasePlayer.Die"
+
+
+@pytest.mark.asyncio
+async def test_tool_get_hook_signature_handles_quoted_args(hook_callsite_connection):
+	"""Quoted strings in hook args must not break JSON decoding downstream."""
+	result = await tool_get_hook_signature(hook_callsite_connection, None, "OnPlayerDeath")
+	# If json.dumps/json.loads round-trip is wrong, the tool would raise
+	assert isinstance(result[0]["parameters"], list)
+
+
+@pytest.mark.asyncio
+async def test_tool_get_hook_signature_unknown_returns_message(populated_connection):
+	result = await tool_get_hook_signature(populated_connection, None, "NoSuchHook")
+	assert "not found" in result[0]["message"].lower()

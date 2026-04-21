@@ -196,3 +196,99 @@ def test_fts_finds_type_by_doc_comment(extended_connection):
 		"SELECT * FROM types_fts WHERE types_fts MATCH 'player entity'"
 	).fetchall()
 	assert len(rows) >= 1
+
+
+HOOK_CALLSITE_CS = """\
+namespace Rust
+{
+	public class BasePlayer
+	{
+		public void Die(HitInfo info)
+		{
+			Interface.CallHook("OnPlayerDeath", this, info);
+		}
+
+		public void Respawn()
+		{
+			Interface.Call("OnPlayerRespawn", this);
+		}
+	}
+}
+"""
+
+
+@pytest.fixture
+def hook_callsite_connection(tmp_path):
+	cs_file = tmp_path / "Assembly-CSharp.cs"
+	cs_file.write_text(HOOK_CALLSITE_CS)
+	connection = sqlite3.connect(":memory:")
+	connection.row_factory = sqlite3.Row
+	create_schema(connection)
+	index_cs_file(connection, cs_file, source="rust")
+	populate_fts(connection)
+	yield connection
+	connection.close()
+
+
+def test_hooks_table_populated_from_callhook(hook_callsite_connection):
+	rows = hook_callsite_connection.execute(
+		"SELECT name FROM hooks"
+	).fetchall()
+	names = {row["name"] for row in rows}
+	assert "OnPlayerDeath" in names
+	assert "OnPlayerRespawn" in names
+
+
+def test_hooks_table_records_calling_method(hook_callsite_connection):
+	row = hook_callsite_connection.execute(
+		"SELECT calling_method, calling_type_fqn FROM hooks WHERE name = 'OnPlayerDeath'"
+	).fetchone()
+	assert row["calling_method"] == "Die"
+	assert row["calling_type_fqn"] == "Rust.BasePlayer"
+
+
+NOISE_CS = """\
+namespace Microsoft.CodeAnalysis.EmbeddedAttribute
+{
+	public class EmbeddedAttribute
+	{
+	}
+}
+"""
+
+REAL_CS = """\
+namespace Rust
+{
+	public class RealType
+	{
+	}
+}
+"""
+
+
+@pytest.fixture
+def noise_filtered_connection(tmp_path):
+	noise_file = tmp_path / "NoiseAssembly.cs"
+	noise_file.write_text(NOISE_CS)
+	real_file = tmp_path / "Assembly-CSharp.cs"
+	real_file.write_text(REAL_CS)
+	connection = sqlite3.connect(":memory:")
+	connection.row_factory = sqlite3.Row
+	create_schema(connection)
+	index_cs_file(connection, noise_file, source="rust")
+	index_cs_file(connection, real_file, source="rust")
+	populate_fts(connection)
+	yield connection
+	connection.close()
+
+
+def test_noise_namespace_excluded_from_index(noise_filtered_connection):
+	rows = noise_filtered_connection.execute("SELECT fully_qualified_name FROM types").fetchall()
+	fqns = {row["fully_qualified_name"] for row in rows}
+	assert not any(fqn.startswith("Microsoft.CodeAnalysis") for fqn in fqns)
+
+
+def test_real_type_survives_noise_filter(noise_filtered_connection):
+	rows = noise_filtered_connection.execute("SELECT fully_qualified_name FROM types").fetchall()
+	fqns = {row["fully_qualified_name"] for row in rows}
+	assert "Rust.RealType" in fqns

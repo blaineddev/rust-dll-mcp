@@ -4,7 +4,36 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-from pipeline.parse_cs import parse_cs_file
+from pipeline.parse_cs import parse_cs_file, extract_hook_calls
+
+
+# Namespaces that appear in decompiled output as transitive dependencies.
+# These pollute find_type results and are never useful for Rust game modding.
+EXCLUDED_NAMESPACE_PREFIXES = (
+	"Microsoft.CodeAnalysis",
+	"System.Runtime.CompilerServices",
+	"System.Reflection",
+	"System.Diagnostics.CodeAnalysis",
+	"System.ComponentModel",
+	"<PrivateImplementationDetails>",
+	"Internal.Runtime",
+	"System.Numerics",
+	"System.Buffers",
+	"System.Memory",
+	"System.Threading.Tasks.Sources",
+)
+
+
+def _is_excluded_type(parsed_type) -> bool:
+	"""Return True if a parsed type belongs to a noise namespace."""
+	ns = parsed_type.namespace
+	fqn = parsed_type.fully_qualified_name
+	if any(ns.startswith(prefix) or fqn.startswith(prefix) for prefix in EXCLUDED_NAMESPACE_PREFIXES):
+		return True
+	# Compiler-generated types
+	if "<PrivateImplementationDetails>" in fqn or fqn.startswith("<"):
+		return True
+	return False
 
 
 def _assembly_source(assembly_name: str) -> str:
@@ -37,6 +66,9 @@ def index_cs_file(
 	parsed_types = parse_cs_file(source_text)
 
 	fqn_to_id: dict[str, int] = {}
+
+	# Filter out noise namespaces (Microsoft.CodeAnalysis, compiler internals, etc.)
+	parsed_types = [t for t in parsed_types if not _is_excluded_type(t)]
 
 	for parsed_type in parsed_types:
 		parent_id = fqn_to_id.get(parsed_type.parent_name) if parsed_type.parent_name else None
@@ -94,6 +126,24 @@ def index_cs_file(
 					member.doc_comment,
 				),
 			)
+
+	# Extract Interface.CallHook/Call patterns and store in hooks table
+	hook_calls = extract_hook_calls(parsed_types)
+	for hook in hook_calls:
+		connection.execute(
+			"""
+			INSERT INTO hooks (name, calling_type_fqn, calling_method, parameters, source_context, assembly_id)
+			VALUES (?, ?, ?, ?, ?, ?)
+			""",
+			(
+				hook.hook_name,
+				hook.calling_type_fqn,
+				hook.calling_method,
+				hook.args_snippet,
+				None,
+				assembly_id,
+			),
+		)
 
 	connection.commit()
 	return assembly_id

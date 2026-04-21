@@ -260,3 +260,85 @@ def test_query_find_implementations_returns_empty_for_unknown(populated_connecti
 	from rust_dll_mcp.db import query_find_implementations
 	results = query_find_implementations(populated_connection, "UnknownXYZ")
 	assert results == []
+
+
+def test_find_type_filters_noise_from_legacy_db(bare_connection):
+	"""Query-time filter handles DBs built before noise-filtering was added."""
+	bare_connection.row_factory = sqlite3.Row
+	create_schema(bare_connection)
+	bare_connection.execute(
+		"INSERT INTO assemblies (name, source) VALUES ('Assembly-CSharp', 'rust')"
+	)
+	assembly_id = bare_connection.execute("SELECT id FROM assemblies").fetchone()[0]
+	bare_connection.execute(
+		"INSERT INTO types (name, fully_qualified_name, kind, namespace, assembly_id) VALUES (?, ?, ?, ?, ?)",
+		("NullableAttribute", "System.Runtime.CompilerServices.NullableAttribute", "class", "System.Runtime.CompilerServices", assembly_id),
+	)
+	bare_connection.execute(
+		"INSERT INTO types (name, fully_qualified_name, kind, namespace, assembly_id) VALUES (?, ?, ?, ?, ?)",
+		("Attribute", "Microsoft.CodeAnalysis.EmbeddedAttribute", "class", "Microsoft.CodeAnalysis", assembly_id),
+	)
+	bare_connection.execute(
+		"INSERT INTO types (name, fully_qualified_name, kind, namespace, assembly_id) VALUES (?, ?, ?, ?, ?)",
+		("PlayerAttribute", "Rust.PlayerAttribute", "class", "Rust", assembly_id),
+	)
+	bare_connection.commit()
+
+	results = query_find_type(bare_connection, "Attribute")
+	fqns = {row["fully_qualified_name"] for row in results}
+	assert "Rust.PlayerAttribute" in fqns
+	assert not any(f.startswith("Microsoft.CodeAnalysis") for f in fqns)
+	assert not any(f.startswith("System.Runtime.CompilerServices") for f in fqns)
+
+
+HOOK_CALLSITE_CS = """\
+namespace Rust
+{
+	public class BasePlayer
+	{
+		public void Die()
+		{
+			Interface.CallHook("OnPlayerDeath", this, "with \\"quoted\\" arg");
+		}
+	}
+}
+"""
+
+
+@pytest.fixture
+def hook_callsite_db(tmp_path):
+	cs_file = tmp_path / "Assembly-CSharp.cs"
+	cs_file.write_text(HOOK_CALLSITE_CS)
+	connection = sqlite3.connect(":memory:")
+	connection.row_factory = sqlite3.Row
+	create_schema(connection)
+	index_cs_file(connection, cs_file, source="rust")
+	populate_fts(connection)
+	yield connection
+	connection.close()
+
+
+def test_get_hook_signature_returns_callsite_results(hook_callsite_db):
+	results = query_get_hook_signature(hook_callsite_db, "OnPlayerDeath")
+	assert len(results) >= 1
+	assert results[0]["name"] == "OnPlayerDeath"
+
+
+def test_get_hook_signature_callsite_parameters_are_valid_json(hook_callsite_db):
+	import json
+	results = query_get_hook_signature(hook_callsite_db, "OnPlayerDeath")
+	row = results[0]
+	# parameters must parse as JSON even when args contain quotes
+	parsed = json.loads(row["parameters"])
+	assert isinstance(parsed, list)
+	assert parsed[0]["call_site"] == "Rust.BasePlayer.Die"
+
+
+def test_get_hook_signature_handles_missing_hooks_table(bare_connection):
+	"""Older DBs without the hooks table should not error."""
+	bare_connection.row_factory = sqlite3.Row
+	create_schema(bare_connection)
+	bare_connection.execute("DROP TABLE hooks")
+	bare_connection.commit()
+	results = query_get_hook_signature(bare_connection, "SomeHook")
+	assert results == []
