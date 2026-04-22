@@ -10,3 +10,4 @@ work/
 *.db
 *.token
 Thumbs.db
+.claude/
