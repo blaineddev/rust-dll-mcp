@@ -44,7 +44,8 @@ class ParsedType:
 	parent_name: str | None = None
 
 
-NAMESPACE_PATTERN = re.compile(r'\bnamespace\s+([\w.]+)')
+NAMESPACE_BLOCK_PATTERN = re.compile(r'\bnamespace\s+(?P<name>[\w.]+)\s*\{')
+NAMESPACE_FILESCOPED_PATTERN = re.compile(r'\bnamespace\s+(?P<name>[\w.]+)\s*;')
 
 # Matches Interface.CallHook("HookName", arg1, arg2, ...) and Interface.Call("HookName", ...)
 HOOK_CALL_PATTERN = re.compile(
@@ -456,37 +457,48 @@ def _parse_members(type_body: str) -> list[ParsedMember]:
 	return members
 
 
-def parse_cs_file(source: str) -> list[ParsedType]:
-	"""Parse a decompiled C# source string and return a list of ParsedType objects."""
-	namespace_match = NAMESPACE_PATTERN.search(source)
-	namespace = namespace_match.group(1) if namespace_match else ''
+def _parse_types_in_scope(body: str, current_namespace: str) -> list[ParsedType]:
+	"""Parse types and nested namespaces at a given scope, tagging each type with current_namespace."""
+	parsed_types: list[ParsedType] = []
+	cursor = 0
 
-	parsed_types = []
-	search_start = 0
+	while cursor < len(body):
+		ns_match = NAMESPACE_BLOCK_PATTERN.search(body, cursor)
+		type_match = TYPE_DECLARATION_PATTERN.search(body, cursor)
 
-	while True:
-		match = TYPE_DECLARATION_PATTERN.search(source, search_start)
-		if not match:
+		if ns_match is None and type_match is None:
 			break
 
-		kind = match.group('kind')
-		name = match.group('name')
-		access_modifier = match.group('access') or 'internal'
-		modifiers_str = match.group('modifiers') or ''
-		inheritance_str = (match.group('inheritance') or '').strip()
+		pick_namespace = ns_match is not None and (type_match is None or ns_match.start() < type_match.start())
+
+		if pick_namespace:
+			nested_ns = ns_match.group('name')
+			full_ns = f"{current_namespace}.{nested_ns}" if current_namespace else nested_ns
+			# match.end() - 1 is the '{' of the namespace block; _extract_block finds it and returns the braced body.
+			ns_body, end_position = _extract_block(body, ns_match.end() - 1)
+			inner = ns_body[1:-1] if ns_body.startswith('{') and ns_body.endswith('}') else ns_body
+			parsed_types.extend(_parse_types_in_scope(inner, full_ns))
+			cursor = end_position
+			continue
+
+		kind = type_match.group('kind')
+		name = type_match.group('name')
+		access_modifier = type_match.group('access') or 'internal'
+		modifiers_str = type_match.group('modifiers') or ''
+		inheritance_str = (type_match.group('inheritance') or '').strip()
 		base_type, interfaces = _parse_inheritance(inheritance_str)
-		fully_qualified_name = f"{namespace}.{name}" if namespace else name
+		fully_qualified_name = f"{current_namespace}.{name}" if current_namespace else name
 
-		body, end_position = _extract_block(source, match.end())
-		type_source = source[match.start():end_position]
+		type_body, end_position = _extract_block(body, type_match.end())
+		type_source = body[type_match.start():end_position]
 
-		clean_body, nested_sources = _extract_nested_type_sources(body)
+		clean_body, nested_sources = _extract_nested_type_sources(type_body)
 		members = _parse_members(clean_body) if kind != 'enum' else _parse_enum_values(clean_body)
 
-		doc_comment = _extract_doc_comment(source, match.start())
+		doc_comment = _extract_doc_comment(body, type_match.start())
 
 		parsed_types.append(ParsedType(
-			namespace=namespace,
+			namespace=current_namespace,
 			name=name,
 			fully_qualified_name=fully_qualified_name,
 			kind=kind,
@@ -501,11 +513,19 @@ def parse_cs_file(source: str) -> list[ParsedType]:
 			doc_comment=doc_comment,
 		))
 
-		parsed_types.extend(_parse_nested_types(nested_sources, fully_qualified_name, namespace))
-
-		search_start = end_position
+		parsed_types.extend(_parse_nested_types(nested_sources, fully_qualified_name, current_namespace))
+		cursor = end_position
 
 	return parsed_types
+
+
+def parse_cs_file(source: str) -> list[ParsedType]:
+	"""Parse a decompiled C# source string and return a list of ParsedType objects."""
+	filescoped = NAMESPACE_FILESCOPED_PATTERN.search(source)
+	blockscoped = NAMESPACE_BLOCK_PATTERN.search(source)
+	if filescoped is not None and (blockscoped is None or filescoped.start() < blockscoped.start()):
+		return _parse_types_in_scope(source[filescoped.end():], filescoped.group('name'))
+	return _parse_types_in_scope(source, '')
 
 
 def extract_hook_calls(parsed_types: list[ParsedType]) -> list[ParsedHookCall]:

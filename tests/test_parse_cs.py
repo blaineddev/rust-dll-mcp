@@ -478,3 +478,100 @@ def test_parse_field_without_access_modifier_does_not_override_method():
 	types = parse_cs_file(NO_ACCESS_FIELD_CS)
 	field_names = {m.name for m in types[0].members if m.kind == "field"}
 	assert "DoWork" not in field_names
+
+
+MULTI_NAMESPACE_CS = """\
+namespace System.Runtime.CompilerServices
+{
+	internal sealed class NullableContextAttribute : Attribute
+	{
+	}
+}
+
+namespace Rust
+{
+	public class BaseEntity
+	{
+		public int health;
+	}
+
+	public class BasePlayer : BaseEntity
+	{
+	}
+}
+
+namespace Oxide.Game.Rust
+{
+	public class RustCore
+	{
+	}
+}
+"""
+
+
+def test_multi_namespace_types_attributed_correctly():
+	types = parse_cs_file(MULTI_NAMESPACE_CS)
+	by_name = {t.name: t for t in types}
+	assert by_name["NullableContextAttribute"].namespace == "System.Runtime.CompilerServices"
+	assert by_name["BaseEntity"].namespace == "Rust"
+	assert by_name["BasePlayer"].namespace == "Rust"
+	assert by_name["RustCore"].namespace == "Oxide.Game.Rust"
+
+
+def test_multi_namespace_fqns_correct():
+	types = parse_cs_file(MULTI_NAMESPACE_CS)
+	fqns = {t.fully_qualified_name for t in types}
+	assert "Rust.BaseEntity" in fqns
+	assert "Rust.BasePlayer" in fqns
+	assert "Oxide.Game.Rust.RustCore" in fqns
+	assert "System.Runtime.CompilerServices.NullableContextAttribute" in fqns
+
+
+NESTED_NAMESPACE_CS = """\
+namespace Outer
+{
+	public class AtOuter
+	{
+	}
+
+	namespace Inner
+	{
+		public class AtInner
+		{
+		}
+	}
+}
+"""
+
+
+def test_nested_namespace_types_attributed_correctly():
+	types = parse_cs_file(NESTED_NAMESPACE_CS)
+	by_name = {t.name: t for t in types}
+	assert by_name["AtOuter"].namespace == "Outer"
+	assert by_name["AtInner"].namespace == "Outer.Inner"
+	assert by_name["AtOuter"].fully_qualified_name == "Outer.AtOuter"
+	assert by_name["AtInner"].fully_qualified_name == "Outer.Inner.AtInner"
+
+
+GLOBAL_SCOPE_CS = """\
+public class NoNamespace
+{
+	public int value;
+}
+
+namespace Rust
+{
+	public class InNamespace
+	{
+	}
+}
+"""
+
+
+def test_global_scope_type_has_empty_namespace():
+	types = parse_cs_file(GLOBAL_SCOPE_CS)
+	by_name = {t.name: t for t in types}
+	assert by_name["NoNamespace"].namespace == ""
+	assert by_name["NoNamespace"].fully_qualified_name == "NoNamespace"
+	assert by_name["InNamespace"].namespace == "Rust"
+	assert by_name["InNamespace"].fully_qualified_name == "Rust.InNamespace"
