@@ -8,11 +8,14 @@ Usage:
 	python pipeline/download_dlls.py --output-dir work/dlls
 """
 import argparse
+import io
 import os
 import platform
 import shutil
 import subprocess
 import sys
+import urllib.request
+import zipfile
 from pathlib import Path
 
 
@@ -20,6 +23,8 @@ STEAM_APP_ID = "258550"
 STEAM_DEPOT_ID = "258552"
 STEAMCMD_URL_LINUX = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd_linux.tar.gz"
 STEAMCMD_URL_WINDOWS = "https://steamcdn-a.akamaihd.net/client/installer/steamcmd.zip"
+OXIDE_URL = "https://github.com/OxideMod/Oxide.Rust/releases/latest/download/Oxide.Rust.zip"
+OXIDE_MANAGED_PREFIX = "RustDedicated_Data/Managed/"
 
 
 def install_steamcmd(install_dir: Path) -> Path:
@@ -91,11 +96,39 @@ def download_depot(steamcmd_executable: Path, output_dir: Path) -> None:
 	print(f"Done. {len(dll_files)} DLLs in {output_dir}", flush=True)
 
 
+def overlay_oxide(output_dir: Path) -> None:
+	"""Overwrite Facepunch DLLs with Oxide.Rust's patched versions.
+
+	Oxide.Rust.zip ships Assembly-CSharp.dll and related DLLs with Interface.CallHook
+	injections and publicized members — this is the surface plugin authors see in their IDE.
+	"""
+	print(f"Downloading Oxide.Rust overlay from {OXIDE_URL}", flush=True)
+	with urllib.request.urlopen(OXIDE_URL) as response:
+		zip_bytes = response.read()
+
+	overlaid = 0
+	with zipfile.ZipFile(io.BytesIO(zip_bytes)) as archive:
+		for member in archive.namelist():
+			if not member.endswith(".dll"):
+				continue
+			if OXIDE_MANAGED_PREFIX not in member.replace("\\", "/"):
+				continue
+			target = output_dir / Path(member).name
+			with archive.open(member) as source, open(target, "wb") as destination:
+				shutil.copyfileobj(source, destination)
+			overlaid += 1
+
+	print(f"Overlaid {overlaid} Oxide-patched DLLs into {output_dir}", flush=True)
+
+
 if __name__ == "__main__":
 	argument_parser = argparse.ArgumentParser(description="Download RustDedicated managed DLLs via SteamCMD")
 	argument_parser.add_argument("--output-dir", type=Path, default=Path("work/dlls"))
 	argument_parser.add_argument("--steamcmd-dir", type=Path, default=Path("work/steamcmd"))
+	argument_parser.add_argument("--skip-oxide-overlay", action="store_true", help="Skip overlaying Oxide.Rust patched DLLs")
 	args = argument_parser.parse_args()
 
 	steamcmd_executable = install_steamcmd(args.steamcmd_dir)
 	download_depot(steamcmd_executable, args.output_dir)
+	if not args.skip_oxide_overlay:
+		overlay_oxide(args.output_dir)
