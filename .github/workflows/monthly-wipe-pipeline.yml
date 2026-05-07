@@ -2,8 +2,8 @@ name: Monthly Wipe Pipeline
 
 on:
   schedule:
-    # First Thursday of each month at 18:00 UTC
-    - cron: '0 18 1-7 * 4'
+    # Every Thursday at 18:00 UTC; job exits early unless it's the first Thursday of the month
+    - cron: '0 18 * * 4'
   workflow_dispatch:
     inputs:
       build_id:
@@ -14,7 +14,24 @@ permissions:
   contents: write
 
 jobs:
+  gate:
+    runs-on: ubuntu-latest
+    outputs:
+      run: ${{ steps.check.outputs.run }}
+    steps:
+      - name: Check if first Thursday of month
+        id: check
+        run: |
+          if [ "${{ github.event_name }}" != "schedule" ] || [ "$(date -u +%d)" -le 7 ]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Not the first Thursday of the month; skipping build."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+
   build:
+    needs: gate
+    if: needs.gate.outputs.run == 'true'
     runs-on: ubuntu-latest
     env:
       PYTHONPATH: ${{ github.workspace }}
