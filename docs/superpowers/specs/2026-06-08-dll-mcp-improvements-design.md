@@ -68,7 +68,11 @@ change; tests updated):
   "fully_qualified_name": "BasePlayer",
   "base_type": "BaseCombatEntity",
   "interfaces": ["..."],
-  "members": [ /* BasePlayer's own members, full detail */ ],
+  "source": "rust",
+  "members": [
+    { "name": "GiveItem", "kind": "method", "return_type": "bool", "params": "Item item, int slot" },
+    { "name": "isMounted", "kind": "field", "return_type": "bool" }
+  ],
   "inherited_summary": [
     { "declaring_type": "BaseCombatEntity",  "source": "rust", "member_count": 109 },
     { "declaring_type": "BaseEntity",        "source": "rust", "member_count": 458 },
@@ -81,7 +85,12 @@ change; tests updated):
 }
 ```
 
-The `inherited_summary` costs ~50 tokens regardless of chain size.
+The `inherited_summary` costs ~50 tokens regardless of chain size. Because the
+response no longer flattens, every member belongs to the queried type, so
+`source` is hoisted to the envelope and not repeated per member. Member objects
+are slimmed per the token-optimization section: `params` is a signature string,
+and empty/default fields (`parameters`, `attributes`, non-`public`
+`access_modifier`) are omitted.
 
 ### Going deeper = manual recursion
 
@@ -190,12 +199,51 @@ gracefully. Most files have no namespace, yielding FQNs like `CommunityEntity`,
   parameter.
 - `search_usages`: add `source` to each result; add an optional `source` filter
   parameter.
-- `get_type_members`: members and `inherited_summary` entries already carry
-  `source` (item 1).
+- `get_type_members`: `source` is emitted once at the envelope top level, and
+  each `inherited_summary` entry carries its own `source` (item 1).
 - `search_source`: `source` filter and label built in (item 2).
 
 This lets a query be scoped to client-only vs server-only and makes every
 result's origin explicit — directly killing the "looked complete" failure mode.
+
+## Item 5 — token optimization (cross-cutting)
+
+The MCP is to be as token-efficient as possible without losing functionality.
+All responses are serialized in `server.py:call_tool` via
+`json.dumps(result, indent=2)`, so encoding choices apply to every tool at once.
+Measured on the real 590 MB DB against BasePlayer's own 1,024 members (the new
+default payload), these compound from ~57,200 tokens to ~24,700 (−57%).
+
+### Lossless (absent value is fully recoverable / derivable)
+
+1. **Compact serialization.** Switch the global `json.dumps` to
+   `separators=(",", ":")` (drop `indent=2`). −31% on every non-string tool
+   response, no shape change. `get_method_source` returns a raw string and is
+   unaffected.
+2. **Omit empty/default fields** in member serialization: drop `parameters` and
+   `attributes` when empty, drop `access_modifier` when `public`. Of the 1,024
+   sample members, 977 have no attributes and 621 have no parameters, so this is
+   the largest single lever (−51% cumulative). Absent field == empty/default.
+3. **Trim leading whitespace** on `search_source` snippet lines. Decompiled code
+   is deeply indented; indentation carries no information in a grep snippet.
+4. **Drop `namespace`** from `find_type` results — it is always a prefix of
+   `fully_qualified_name`.
+
+### Contract changes (approved; detail still reachable on demand)
+
+5. **`params` as a signature string** in `get_type_members` listings, e.g.
+   `"Item item, int slot"` instead of `[{"type":"Item","name":"item"}]`. Brings
+   the listing to −57%. The listing is an overview; the canonical structured
+   signature remains available via `get_method_source`.
+6. **Slim `diff_since_last_wipe`.** For changed members, return
+   `name`, `kind`, `signature`, and a `source_changed` flag instead of inlining
+   both full source bodies; added/removed return signatures only. A large
+   type's diff drops from tens of thousands of tokens to a compact summary;
+   exact source is fetched via `get_method_source` when needed.
+
+These apply across all tools, not just the three new behaviors — the compact and
+omit-empty rules are implemented in shared serialization helpers so every
+current and future tool benefits.
 
 ## Testing
 
@@ -209,6 +257,12 @@ result's origin explicit — directly killing the "looked complete" failure mode
   line is findable via `search_source` and tagged `source="community"`.
 - **Item 4:** `source` present on `find_type`/`search_usages` results; filter
   scopes correctly.
+- **Item 5:** serialized output contains no indentation whitespace; members with
+  empty parameters/attributes omit those keys; `public` access modifier is
+  omitted; `params` is a signature string; `find_type` results have no
+  `namespace` key; slimmed diff returns signatures + `source_changed` rather
+  than full bodies. A round-trip test confirms omitted fields are unambiguously
+  interpretable as their defaults.
 
 ## Out of scope
 
