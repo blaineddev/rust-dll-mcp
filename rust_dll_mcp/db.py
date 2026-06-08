@@ -1,6 +1,8 @@
 import json
 import sqlite3
 
+from rust_dll_mcp.serialize import member_signature
+
 # Noise namespaces filtered out of find_type results at query time.
 # Mirrors the exclusion list in pipeline/build_index.py for existing DBs.
 _EXCLUDED_FQN_PREFIXES = (
@@ -115,33 +117,36 @@ def create_schema(connection: sqlite3.Connection) -> None:
 	connection.commit()
 
 
-def query_find_type(connection: sqlite3.Connection, name: str) -> list[sqlite3.Row]:
-	"""Fuzzy search for types by name. FTS5 first, LIKE fallback."""
-	fts_rows = connection.execute(
-		"""
-		SELECT t.id, t.name, t.fully_qualified_name, t.kind, t.namespace, a.name AS assembly_name
+def query_find_type(
+	connection: sqlite3.Connection,
+	name: str,
+	source: str | None = None,
+) -> list[sqlite3.Row]:
+	"""Fuzzy search for types by name. FTS5 first, LIKE fallback. Optional source filter."""
+	fts_sql = """
+		SELECT t.id, t.name, t.fully_qualified_name, t.kind, a.name AS assembly_name, a.source AS source
 		FROM types_fts
 		JOIN types t ON types_fts.rowid = t.id
 		LEFT JOIN assemblies a ON t.assembly_id = a.id
 		WHERE types_fts MATCH ?
-		LIMIT 10
-		""",
-		(name,),
-	).fetchall()
-
+	"""
+	if source:
+		fts_rows = connection.execute(fts_sql + " AND a.source = ? LIMIT 10", (name, source)).fetchall()
+	else:
+		fts_rows = connection.execute(fts_sql + " LIMIT 10", (name,)).fetchall()
 	if fts_rows:
 		return _filter_noise_types(fts_rows)
 
-	rows = connection.execute(
-		"""
-		SELECT t.id, t.name, t.fully_qualified_name, t.kind, t.namespace, a.name AS assembly_name
+	like_sql = """
+		SELECT t.id, t.name, t.fully_qualified_name, t.kind, a.name AS assembly_name, a.source AS source
 		FROM types t
 		LEFT JOIN assemblies a ON t.assembly_id = a.id
 		WHERE t.name LIKE ?
-		LIMIT 25
-		""",
-		(f"%{name}%",),
-	).fetchall()
+	"""
+	if source:
+		rows = connection.execute(like_sql + " AND a.source = ? LIMIT 25", (f"%{name}%", source)).fetchall()
+	else:
+		rows = connection.execute(like_sql + " LIMIT 25", (f"%{name}%",)).fetchall()
 	return _filter_noise_types(rows)[:10]
 
 
@@ -175,6 +180,152 @@ def query_get_type_members(
 	).fetchall()
 
 
+def _strip_generics(type_name: str) -> str:
+	return type_name.split("<", 1)[0].strip()
+
+
+def _resolve_type_fqn(connection: sqlite3.Connection, name: str) -> str | None:
+	row = connection.execute(
+		"SELECT fully_qualified_name FROM types WHERE fully_qualified_name = ? LIMIT 1",
+		(name,),
+	).fetchone()
+	if row:
+		return row["fully_qualified_name"]
+	row = connection.execute(
+		"SELECT fully_qualified_name FROM types WHERE name = ? LIMIT 1",
+		(name,),
+	).fetchone()
+	return row["fully_qualified_name"] if row else None
+
+
+def _type_base(connection: sqlite3.Connection, fully_qualified_name: str) -> str:
+	"""Non-empty base_type among partial-class rows for an FQN, or ''."""
+	rows = connection.execute(
+		"SELECT base_type FROM types WHERE fully_qualified_name = ?",
+		(fully_qualified_name,),
+	).fetchall()
+	for row in rows:
+		if row["base_type"]:
+			return row["base_type"]
+	return ""
+
+
+def _type_source(connection: sqlite3.Connection, fully_qualified_name: str) -> str | None:
+	row = connection.execute(
+		"""
+		SELECT a.source FROM types t
+		LEFT JOIN assemblies a ON t.assembly_id = a.id
+		WHERE t.fully_qualified_name = ? LIMIT 1
+		""",
+		(fully_qualified_name,),
+	).fetchone()
+	return row["source"] if row and row["source"] else None
+
+
+def _member_count(connection: sqlite3.Connection, fully_qualified_name: str) -> int:
+	row = connection.execute(
+		"""
+		SELECT COUNT(*) AS n FROM members m
+		JOIN types t ON m.type_id = t.id
+		WHERE t.fully_qualified_name = ?
+		""",
+		(fully_qualified_name,),
+	).fetchone()
+	return row["n"]
+
+
+def query_type_header(
+	connection: sqlite3.Connection,
+	fully_qualified_name: str,
+	assembly_name: str | None = None,
+) -> tuple[str, list[str], str | None]:
+	"""Return (base_type, interfaces, source), aggregating partial-class rows."""
+	if assembly_name:
+		rows = connection.execute(
+			"""
+			SELECT t.base_type, t.interfaces, a.source FROM types t
+			JOIN assemblies a ON t.assembly_id = a.id
+			WHERE t.fully_qualified_name = ? AND a.name = ?
+			""",
+			(fully_qualified_name, assembly_name),
+		).fetchall()
+	else:
+		rows = connection.execute(
+			"""
+			SELECT t.base_type, t.interfaces, a.source FROM types t
+			LEFT JOIN assemblies a ON t.assembly_id = a.id
+			WHERE t.fully_qualified_name = ?
+			""",
+			(fully_qualified_name,),
+		).fetchall()
+	base_type = ""
+	interfaces: list[str] = []
+	source: str | None = None
+	for row in rows:
+		if row["base_type"] and not base_type:
+			base_type = row["base_type"]
+		for interface in json.loads(row["interfaces"] or "[]"):
+			if interface not in interfaces:
+				interfaces.append(interface)
+		if row["source"] and source is None:
+			source = row["source"]
+	return base_type, interfaces, source
+
+
+def query_inheritance_summary(
+	connection: sqlite3.Connection,
+	fully_qualified_name: str,
+) -> tuple[list[dict], list[str]]:
+	"""Walk the base chain. Returns (summary, unresolved_bases)."""
+	summary: list[dict] = []
+	unresolved: list[str] = []
+	seen = {fully_qualified_name}
+	current_base = _type_base(connection, fully_qualified_name)
+	while current_base:
+		resolved = _resolve_type_fqn(connection, _strip_generics(current_base))
+		if not resolved:
+			unresolved.append(current_base)
+			break
+		if resolved in seen:
+			break
+		seen.add(resolved)
+		summary.append({
+			"declaring_type": resolved,
+			"source": _type_source(connection, resolved),
+			"member_count": _member_count(connection, resolved),
+		})
+		current_base = _type_base(connection, resolved)
+	return summary, unresolved
+
+
+def query_member_sources(
+	connection: sqlite3.Connection,
+	source: str | None = None,
+):
+	"""Iterate (type_fqn, name, kind, source, source_code) over all members, optionally one source."""
+	if source:
+		return connection.execute(
+			"""
+			SELECT t.fully_qualified_name AS type_fqn, m.name, m.kind,
+			       a.source AS source, m.source_code
+			FROM members m
+			JOIN types t ON m.type_id = t.id
+			LEFT JOIN assemblies a ON t.assembly_id = a.id
+			WHERE a.source = ?
+			""",
+			(source,),
+		)
+	return connection.execute(
+		"""
+		SELECT t.fully_qualified_name AS type_fqn, m.name, m.kind,
+		       a.source AS source, m.source_code
+		FROM members m
+		JOIN types t ON m.type_id = t.id
+		LEFT JOIN assemblies a ON t.assembly_id = a.id
+		"""
+	)
+
+
 def query_get_method_source(
 	connection: sqlite3.Connection,
 	type_fqn: str,
@@ -195,18 +346,22 @@ def query_get_method_source(
 	return row["source_code"] if row else None
 
 
-def query_search_usages(connection: sqlite3.Connection, symbol: str) -> list[sqlite3.Row]:
-	return connection.execute(
-		"""
-		SELECT m.id, m.name, m.kind, t.fully_qualified_name AS type_fqn
+def query_search_usages(
+	connection: sqlite3.Connection,
+	symbol: str,
+	source: str | None = None,
+) -> list[sqlite3.Row]:
+	sql = """
+		SELECT m.id, m.name, m.kind, t.fully_qualified_name AS type_fqn, a.source AS source
 		FROM members_fts
 		JOIN members m ON members_fts.rowid = m.id
 		JOIN types t ON m.type_id = t.id
+		LEFT JOIN assemblies a ON t.assembly_id = a.id
 		WHERE members_fts MATCH ?
-		LIMIT 50
-		""",
-		(symbol,),
-	).fetchall()
+	"""
+	if source:
+		return connection.execute(sql + " AND a.source = ? LIMIT 50", (symbol, source)).fetchall()
+	return connection.execute(sql + " LIMIT 50", (symbol,)).fetchall()
 
 
 def query_get_hook_signature(connection: sqlite3.Connection, hook_name: str) -> list[sqlite3.Row]:
@@ -309,10 +464,23 @@ def query_diff_since_last_wipe(
 	current_members = get_members(current_connection)
 	previous_members = get_members(previous_connection)
 
-	added = [dict(row) for name, row in current_members.items() if name not in previous_members]
-	removed = [dict(row) for name, row in previous_members.items() if name not in current_members]
+	added = [
+		{"name": row["name"], "kind": row["kind"], "signature": member_signature(row)}
+		for name, row in current_members.items()
+		if name not in previous_members
+	]
+	removed = [
+		{"name": row["name"], "kind": row["kind"], "signature": member_signature(row)}
+		for name, row in previous_members.items()
+		if name not in current_members
+	]
 	changed = [
-		{"name": name, "current": dict(current_members[name]), "previous": dict(previous_members[name])}
+		{
+			"name": name,
+			"kind": current_members[name]["kind"],
+			"signature": member_signature(current_members[name]),
+			"source_changed": True,
+		}
 		for name in current_members
 		if name in previous_members
 		and current_members[name]["source_code"] != previous_members[name]["source_code"]

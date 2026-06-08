@@ -176,6 +176,7 @@ def build_index(
 	build_id: str,
 	wipe_date: str,
 	previous_build_id: str | None = None,
+	community_dir: Path | None = None,
 ) -> None:
 	"""Full pipeline: walk source_dir .cs files → populate db_path."""
 	connection = sqlite3.connect(db_path)
@@ -194,6 +195,16 @@ def build_index(
 		except Exception as error:
 			print(f"  WARNING: failed to index {cs_file.name}: {error}", file=sys.stderr, flush=True)
 
+	if community_dir is not None:
+		community_files = list(Path(community_dir).rglob("*.cs"))
+		print(f"Indexing {len(community_files)} community .cs files", flush=True)
+		for cs_file in community_files:
+			try:
+				index_cs_file(connection, cs_file, source="community")
+				print(f"  indexed (community) {cs_file.name}", flush=True)
+			except Exception as error:
+				print(f"  WARNING: failed to index {cs_file.name}: {error}", file=sys.stderr, flush=True)
+
 	populate_fts(connection)
 	write_wipe_metadata(connection, build_id, wipe_date, previous_build_id)
 	connection.close()
@@ -209,6 +220,10 @@ if __name__ == "__main__":
 	argument_parser.add_argument("--build-id", required=True)
 	argument_parser.add_argument("--wipe-date", required=True)
 	argument_parser.add_argument("--previous-build-id")
+	argument_parser.add_argument("--community-dir", type=Path, default=None)
 	args = argument_parser.parse_args()
 
-	build_index(args.source_dir, args.db_path, args.build_id, args.wipe_date, args.previous_build_id)
+	build_index(
+		args.source_dir, args.db_path, args.build_id, args.wipe_date,
+		args.previous_build_id, args.community_dir,
+	)

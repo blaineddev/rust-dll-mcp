@@ -3,8 +3,33 @@ import json
 import pytest
 from pathlib import Path
 from tests.conftest import SAMPLE_CS
-from pipeline.build_index import index_cs_file, populate_fts, write_wipe_metadata
+from pipeline.build_index import index_cs_file, populate_fts, write_wipe_metadata, build_index
 from rust_dll_mcp.db import create_schema
+
+
+def test_build_index_indexes_community_dir(tmp_path):
+	server_dir = tmp_path / "source"
+	server_dir.mkdir()
+	(server_dir / "Assembly-CSharp.cs").write_text(
+		"namespace Rust { public class Foo { public void Bar() { } } }"
+	)
+	community_dir = tmp_path / "community"
+	community_dir.mkdir()
+	(community_dir / "CommunityEntity.UI.cs").write_text(
+		'public partial class CommunityEntity { public void Add() { ShouldUpdateField("rotation"); } }'
+	)
+	db_path = tmp_path / "out.db"
+	build_index(server_dir, db_path, build_id="b1", wipe_date="2026-06-08", community_dir=community_dir)
+
+	connection = sqlite3.connect(db_path)
+	connection.row_factory = sqlite3.Row
+	row = connection.execute(
+		"""
+		SELECT a.source FROM types t JOIN assemblies a ON t.assembly_id = a.id
+		WHERE t.fully_qualified_name = 'CommunityEntity' LIMIT 1
+		"""
+	).fetchone()
+	assert row["source"] == "community"
 
 
 @pytest.fixture

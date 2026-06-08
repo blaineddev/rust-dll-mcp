@@ -75,6 +75,9 @@ jobs:
           PREV_BUILD_ID=$(python -c "import json; data=json.load(open('manifest.json')); print(data.get('buildId',''))")
           echo "previous_build_id=$PREV_BUILD_ID" >> "$GITHUB_OUTPUT"
 
+      - name: Clone Rust.Community client source
+        run: git clone --depth 1 https://github.com/Facepunch/Rust.Community.git work/community
+
       - name: Build SQLite index
         run: |
           python pipeline/build_index.py \
@@ -82,7 +85,8 @@ jobs:
             rust_dlls.db \
             --build-id "${{ steps.wipe_info.outputs.build_id }}" \
             --wipe-date "${{ steps.wipe_info.outputs.wipe_date }}" \
-            --previous-build-id "${{ steps.prev_build.outputs.previous_build_id }}"
+            --previous-build-id "${{ steps.prev_build.outputs.previous_build_id }}" \
+            --community-dir work/community
 
       - name: Create GitHub Release and upload DB
         id: create_release

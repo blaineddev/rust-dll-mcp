@@ -1,6 +1,57 @@
+import pathlib
 import sqlite3
+import tempfile
 import pytest
-from rust_dll_mcp.db import create_schema
+from rust_dll_mcp.db import create_schema, query_type_header, query_inheritance_summary
+from pipeline.build_index import index_cs_file, populate_fts
+
+
+INHERIT_CS = """\
+namespace Game
+{
+	public class Animal
+	{
+		public void Eat() { }
+		public int legs;
+	}
+	public class Dog : Animal
+	{
+		public void Bark() { }
+	}
+}
+"""
+
+
+def _inherit_connection():
+	connection = sqlite3.connect(":memory:")
+	connection.row_factory = sqlite3.Row
+	create_schema(connection)
+	tmp = pathlib.Path(tempfile.mkdtemp()) / "Game.cs"
+	tmp.write_text(INHERIT_CS)
+	index_cs_file(connection, tmp, source="rust")
+	populate_fts(connection)
+	return connection
+
+
+def test_query_type_header_returns_base_and_source():
+	connection = _inherit_connection()
+	base_type, interfaces, source = query_type_header(connection, "Game.Dog")
+	assert base_type == "Animal"
+	assert source == "rust"
+
+
+def test_inheritance_summary_resolves_and_counts():
+	connection = _inherit_connection()
+	summary, unresolved = query_inheritance_summary(connection, "Game.Dog")
+	assert summary == [{"declaring_type": "Game.Animal", "source": "rust", "member_count": 2}]
+	assert unresolved == []
+
+
+def test_inheritance_summary_no_base():
+	connection = _inherit_connection()
+	summary, unresolved = query_inheritance_summary(connection, "Game.Animal")
+	assert summary == []
+	assert unresolved == []
 
 
 @pytest.fixture

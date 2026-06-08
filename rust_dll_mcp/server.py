@@ -9,11 +9,13 @@ from mcp.server.stdio import stdio_server
 from mcp import types
 
 from rust_dll_mcp.updater import ensure_current_db, ensure_previous_db
+from rust_dll_mcp.serialize import compact_json
 from rust_dll_mcp.tools import (
 	tool_find_type,
 	tool_get_type_members,
 	tool_get_method_source,
 	tool_search_usages,
+	tool_search_source,
 	tool_get_hook_signature,
 	tool_diff_since_last_wipe,
 	tool_find_implementations,
@@ -48,6 +50,7 @@ async def run() -> None:
 					"type": "object",
 					"properties": {
 						"name": {"type": "string", "description": "Type name to search for"},
+						"source": {"type": "string", "description": "Optional source filter: rust, oxide, facepunch, or community"},
 					},
 					"required": ["name"],
 				},
@@ -83,8 +86,22 @@ async def run() -> None:
 					"type": "object",
 					"properties": {
 						"symbol": {"type": "string", "description": "Symbol name to search for"},
+						"source": {"type": "string", "description": "Optional source filter: rust, oxide, facepunch, or community"},
 					},
 					"required": ["symbol"],
+				},
+			),
+			types.Tool(
+				name="search_source",
+				description="Regex search over decompiled source bodies. Returns grep-style per-line matches. Use for string literals (e.g. JSON keys) and arbitrary text that search_usages (symbol-only) misses.",
+				inputSchema={
+					"type": "object",
+					"properties": {
+						"pattern": {"type": "string", "description": "Python regular expression to match against source lines"},
+						"source": {"type": "string", "description": "Optional source filter: rust, oxide, facepunch, or community"},
+						"limit": {"type": "integer", "description": "Max matching lines to return (default 50, max 200)"},
+					},
+					"required": ["pattern"],
 				},
 			),
 			types.Tool(
@@ -128,13 +145,15 @@ async def run() -> None:
 	@app.call_tool()
 	async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
 		if name == "find_type":
-			result = await tool_find_type(current_connection, previous_connection, arguments["name"])
+			result = await tool_find_type(current_connection, previous_connection, arguments["name"], arguments.get("source"))
 		elif name == "get_type_members":
 			result = await tool_get_type_members(current_connection, previous_connection, arguments["fully_qualified_name"], arguments.get("assembly_name"))
 		elif name == "get_method_source":
 			result = await tool_get_method_source(current_connection, previous_connection, arguments["type"], arguments["method"])
 		elif name == "search_usages":
-			result = await tool_search_usages(current_connection, previous_connection, arguments["symbol"])
+			result = await tool_search_usages(current_connection, previous_connection, arguments["symbol"], arguments.get("source"))
+		elif name == "search_source":
+			result = await tool_search_source(current_connection, previous_connection, arguments["pattern"], arguments.get("source"), arguments.get("limit", 50))
 		elif name == "get_hook_signature":
 			result = await tool_get_hook_signature(current_connection, previous_connection, arguments["hook_name"])
 		elif name == "diff_since_last_wipe":
@@ -144,7 +163,7 @@ async def run() -> None:
 		else:
 			result = f"Unknown tool: {name}"
 
-		return [types.TextContent(type="text", text=json.dumps(result, indent=2) if not isinstance(result, str) else result)]
+		return [types.TextContent(type="text", text=result if isinstance(result, str) else compact_json(result))]
 
 	print("rust-dll-mcp: ready.", file=sys.stderr, flush=True)
 	async with stdio_server() as (read_stream, write_stream):
