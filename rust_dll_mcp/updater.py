@@ -49,31 +49,35 @@ def save_build_id(cache_dir: Path, build_id: str) -> None:
 	(cache_dir / BUILD_ID_FILE).write_text(build_id)
 
 
-async def ensure_current_db(cache_dir: Path) -> Path:
-	"""Return path to current DB, downloading if stale or missing."""
+async def sync_databases(cache_dir: Path) -> tuple[Path, Path | None]:
+	"""Ensure the cached databases match the latest manifest.
+
+	On a new build, stale caches are deleted and the current (and previous) wipe
+	databases are re-downloaded fresh, so we never serve outdated data. Returns
+	(current_db_path, previous_db_path_or_None).
+	"""
 	manifest = await fetch_manifest()
 	remote_build_id = manifest["buildId"]
 	local_build_id = get_current_build_id(cache_dir)
-	db_path = cache_dir / CURRENT_DB_FILE
+	current_path = cache_dir / CURRENT_DB_FILE
+	previous_path = cache_dir / PREVIOUS_DB_FILE
 
-	if local_build_id == remote_build_id and db_path.exists():
-		print("Local DB is up to date.", file=sys.stderr, flush=True)
-		return db_path
+	if local_build_id == remote_build_id and current_path.exists():
+		print("rust-dll-mcp: database is up to date.", file=sys.stderr, flush=True)
+	else:
+		print(
+			f"rust-dll-mcp: new build (local={local_build_id!r}, remote={remote_build_id!r}); "
+			"clearing cache and downloading.",
+			file=sys.stderr,
+			flush=True,
+		)
+		current_path.unlink(missing_ok=True)
+		previous_path.unlink(missing_ok=True)
+		await download_file(manifest["releaseUrl"], current_path)
+		save_build_id(cache_dir, remote_build_id)
 
-	print(f"Updating DB (local={local_build_id!r}, remote={remote_build_id!r})", file=sys.stderr, flush=True)
-	await download_file(manifest["releaseUrl"], db_path)
-	save_build_id(cache_dir, remote_build_id)
-	return db_path
-
-
-async def ensure_previous_db(cache_dir: Path) -> Path | None:
-	"""Return path to previous wipe DB, downloading on demand. Returns None if unavailable."""
-	manifest = await fetch_manifest()
 	previous_url = manifest.get("previousReleaseUrl", "")
-	if not previous_url:
-		return None
+	if previous_url and not previous_path.exists():
+		await download_file(previous_url, previous_path)
 
-	db_path = cache_dir / PREVIOUS_DB_FILE
-	if not db_path.exists():
-		await download_file(previous_url, db_path)
-	return db_path
+	return current_path, (previous_path if previous_path.exists() else None)

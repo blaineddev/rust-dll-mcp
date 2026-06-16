@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sqlite3
 import sys
@@ -8,7 +9,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp import types
 
-from rust_dll_mcp.updater import ensure_current_db, ensure_previous_db
+from rust_dll_mcp.updater import sync_databases, CURRENT_DB_FILE, PREVIOUS_DB_FILE
 from rust_dll_mcp.serialize import compact_json
 from rust_dll_mcp.tools import (
 	tool_find_type,
@@ -28,15 +29,44 @@ def _open_connection(db_path: Path) -> sqlite3.Connection:
 	return connection
 
 
+class DbState:
+	"""Holds the live database connections, swapped in once the background load finishes."""
+
+	def __init__(self) -> None:
+		self.current: sqlite3.Connection | None = None
+		self.previous: sqlite3.Connection | None = None
+		self.status = "updating"
+		self.message = "rust-dll-mcp is downloading the latest wipe database; please retry in a moment."
+
+
+async def _load_databases(state: DbState, cache_dir: Path) -> None:
+	"""Sync and open the databases, then publish them on the shared state."""
+	try:
+		current_path, previous_path = await sync_databases(cache_dir)
+	except Exception as error:
+		# Network/manifest failure: fall back to a cached DB if one exists, rather
+		# than leaving the server permanently unusable when GitHub is unreachable.
+		cached_current = cache_dir / CURRENT_DB_FILE
+		if cached_current.exists():
+			print(f"rust-dll-mcp: update check failed ({error}); using cached database.", file=sys.stderr, flush=True)
+			current_path = cached_current
+			cached_previous = cache_dir / PREVIOUS_DB_FILE
+			previous_path = cached_previous if cached_previous.exists() else None
+		else:
+			state.status = "error"
+			state.message = f"rust-dll-mcp: database unavailable ({error})."
+			print(state.message, file=sys.stderr, flush=True)
+			return
+
+	state.previous = _open_connection(previous_path) if previous_path else None
+	state.current = _open_connection(current_path)
+	state.status = "ready"
+	print("rust-dll-mcp: database ready.", file=sys.stderr, flush=True)
+
+
 async def run() -> None:
 	cache_dir = Path(platformdirs.user_cache_dir("rust-dll-mcp"))
-
-	print("rust-dll-mcp: checking for updates...", file=sys.stderr, flush=True)
-	current_db_path = await ensure_current_db(cache_dir)
-	current_connection = _open_connection(current_db_path)
-
-	previous_db_path = await ensure_previous_db(cache_dir)
-	previous_connection = _open_connection(previous_db_path) if previous_db_path else None
+	state = DbState()
 
 	app = Server("rust-dll-mcp")
 
@@ -144,31 +174,42 @@ async def run() -> None:
 
 	@app.call_tool()
 	async def call_tool(name: str, arguments: dict) -> list[types.TextContent]:
-		if name == "find_type":
-			result = await tool_find_type(current_connection, previous_connection, arguments["name"], arguments.get("source"))
-		elif name == "get_type_members":
-			result = await tool_get_type_members(current_connection, previous_connection, arguments["fully_qualified_name"], arguments.get("assembly_name"))
-		elif name == "get_method_source":
-			result = await tool_get_method_source(current_connection, previous_connection, arguments["type"], arguments["method"])
-		elif name == "search_usages":
-			result = await tool_search_usages(current_connection, previous_connection, arguments["symbol"], arguments.get("source"))
-		elif name == "search_source":
-			result = await tool_search_source(current_connection, previous_connection, arguments["pattern"], arguments.get("source"), arguments.get("limit", 50))
-		elif name == "get_hook_signature":
-			result = await tool_get_hook_signature(current_connection, previous_connection, arguments["hook_name"])
-		elif name == "diff_since_last_wipe":
-			result = await tool_diff_since_last_wipe(current_connection, previous_connection, arguments["type"])
-		elif name == "find_implementations":
-			result = await tool_find_implementations(current_connection, previous_connection, arguments["type_name"])
-		else:
-			result = f"Unknown tool: {name}"
+		if state.current is None:
+			return [types.TextContent(type="text", text=compact_json({"status": state.status, "message": state.message}))]
+
+		current_connection = state.current
+		previous_connection = state.previous
+
+		match name:
+			case "find_type":
+				result = await tool_find_type(current_connection, previous_connection, arguments["name"], arguments.get("source"))
+			case "get_type_members":
+				result = await tool_get_type_members(current_connection, previous_connection, arguments["fully_qualified_name"], arguments.get("assembly_name"))
+			case "get_method_source":
+				result = await tool_get_method_source(current_connection, previous_connection, arguments["type"], arguments["method"])
+			case "search_usages":
+				result = await tool_search_usages(current_connection, previous_connection, arguments["symbol"], arguments.get("source"))
+			case "search_source":
+				result = await tool_search_source(current_connection, previous_connection, arguments["pattern"], arguments.get("source"), arguments.get("limit", 50))
+			case "get_hook_signature":
+				result = await tool_get_hook_signature(current_connection, previous_connection, arguments["hook_name"])
+			case "diff_since_last_wipe":
+				result = await tool_diff_since_last_wipe(current_connection, previous_connection, arguments["type"])
+			case "find_implementations":
+				result = await tool_find_implementations(current_connection, previous_connection, arguments["type_name"])
+			case _:
+				result = f"Unknown tool: {name}"
 
 		return [types.TextContent(type="text", text=result if isinstance(result, str) else compact_json(result))]
 
-	print("rust-dll-mcp: ready.", file=sys.stderr, flush=True)
-	async with stdio_server() as (read_stream, write_stream):
-		await app.run(read_stream, write_stream, app.create_initialization_options())
-
-	current_connection.close()
-	if previous_connection:
-		previous_connection.close()
+	print("rust-dll-mcp: starting; database loads in the background...", file=sys.stderr, flush=True)
+	loader = asyncio.create_task(_load_databases(state, cache_dir))
+	try:
+		async with stdio_server() as (read_stream, write_stream):
+			await app.run(read_stream, write_stream, app.create_initialization_options())
+	finally:
+		loader.cancel()
+		if state.current:
+			state.current.close()
+		if state.previous:
+			state.previous.close()
