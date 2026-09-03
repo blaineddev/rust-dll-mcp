@@ -1,6 +1,6 @@
 {
-	"buildId": "202608070011",
-	"wipeDate": "2026-08-07",
-	"releaseUrl": "https://github.com/blaineddev/rust-dll-mcp/releases/download/wipe-2026-08-07/rust_dlls.db",
-	"previousReleaseUrl": "https://github.com/blaineddev/rust-dll-mcp/releases/download/wipe-2026-07-02/rust_dlls.db"
+	"buildId": "202609032049",
+	"wipeDate": "2026-09-03",
+	"releaseUrl": "https://github.com/blaineddev/rust-dll-mcp/releases/download/wipe-2026-09-03/rust_dlls.db",
+	"previousReleaseUrl": "https://github.com/blaineddev/rust-dll-mcp/releases/download/wipe-2026-08-07/rust_dlls.db"
 }
